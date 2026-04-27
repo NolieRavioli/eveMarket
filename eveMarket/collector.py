@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 ESI_BASE = "https://esi.evetech.net/latest"
 
 
-def _rprint(msg: str, *, end: bool = False) -> None:
-    rprint("eveMarket.collector", msg, end=end)
+def _rprint(msg: str, *, end: bool = False, client: Optional[EsiClient] = None) -> None:
+    rprint("eveMarket.collector", msg, end=end, client=client)
 
 
 def iter_market_region_ids(sde_dir: Path) -> list[int]:
@@ -99,7 +99,10 @@ def collect_snapshot(
             for region_id in region_ids:
                 if stop_event is not None and stop_event.is_set():
                     raise InterruptedError("collect stopped")
-                _rprint(f"[pages] collecting pages for {region_id}. total pages so far: {total_pages_so_far}")
+                _rprint(
+                    f"[pages] collecting pages for {region_id}. total pages so far: {total_pages_so_far}",
+                    client=client,
+                )
                 url = f"{ESI_BASE}/markets/{region_id}/orders/"
                 params = {"order_type": "all", "datasource": "tranquility", "page": 1}
                 resp = client.get(url, params=params)
@@ -120,7 +123,11 @@ def collect_snapshot(
                 pages_per_region[region_id] = total_pages
                 total_pages_so_far += total_pages
                 orders_total += _write_rows(fout, page1, region_id)
-            _rprint(f"[pages] collecting pages for {region_id}. total pages so far: {total_pages_so_far}", end=True)
+            _rprint(
+                f"[pages] collecting pages for {region_id}. total pages so far: {total_pages_so_far}",
+                end=True,
+                client=client,
+            )
 
             # Phase B: pages 2..N for regions that have more.
             pages_total_b = sum(max(0, p - 1) for p in pages_per_region.values())
@@ -140,7 +147,10 @@ def collect_snapshot(
                         eta_str = f"{eta_m}m {eta_s2:02d}s"
                     else:
                         eta_str = "--"
-                    _rprint(f"[orders] collecting orders. {pages_done_b}/{pages_total_b}. ETA {eta_str}. total orders: {orders_total}")
+                    _rprint(
+                        f"[orders] collecting orders. {pages_done_b}/{pages_total_b}. ETA {eta_str}. total orders: {orders_total}",
+                        client=client,
+                    )
                     params = {"order_type": "all", "datasource": "tranquility", "page": page}
                     resp = client.get(url, params=params)
                     if not resp.ok:
@@ -156,7 +166,11 @@ def collect_snapshot(
                         continue
                     orders_total += _write_rows(fout, rows, region_id)
                     pages_done_b += 1
-            _rprint(f"[orders] collecting orders. {pages_done_b}/{pages_total_b}. ETA 0m 00s. total orders: {orders_total}", end=True)
+            _rprint(
+                f"[orders] collecting orders. {pages_done_b}/{pages_total_b}. ETA 0m 00s. total orders: {orders_total}",
+                end=True,
+                client=client,
+            )
 
             fout.flush()
             os.fsync(fout.fileno())

@@ -30,6 +30,12 @@ from .snapshot import (
     orders_path,
     previous_snapshot,
 )
+from .stats import (
+    compute_history_stats,
+    compute_live_stats,
+    latest_snapshot_path,
+    parse_range,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +109,8 @@ def _make_handler(state: MarketState):
                     "/currentOrders/{location_id}",
                     "/orders/{unix_time}[?location=<id>]",
                     "/inferred/{location_id}",
+                    "POST /stats/{location_id}  body: [type_id, ...]",
+                    "POST /history/{location_id}/{range}  body: [type_id, ...]",
                 ]})
 
             head = parts[0]
@@ -170,6 +178,107 @@ def _make_handler(state: MarketState):
                                         client=state.client)
                 rows = (t for t in trades if _trade_matches(t, info, state.resolver))
                 return self._send_ndjson(rows)
+
+            return self._send_json(404, {"error": "not found", "path": self.path})
+
+        # ---------- POST routes ----------
+        MAX_POST_BYTES = 1 << 20  # 1 MiB
+
+        def _read_body(self):
+            """Return parsed JSON body or send a 4xx response and return None."""
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except (TypeError, ValueError):
+                self._send_json(400, {"error": "missing or invalid Content-Length"})
+                return None
+            if length <= 0:
+                self._send_json(400, {"error": "empty body"})
+                return None
+            if length > self.MAX_POST_BYTES:
+                self._send_json(413, {"error": "body too large",
+                                       "max_bytes": self.MAX_POST_BYTES})
+                return None
+            raw = self.rfile.read(length)
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"error": "invalid JSON body"})
+                return None
+
+        def _parse_type_ids(self, body):
+            """Validate body is a list of int64-ish ids; returns list[int] or None."""
+            if not isinstance(body, list):
+                self._send_json(400, {"error": "body must be an array of type_ids"})
+                return None
+            out: list[int] = []
+            for item in body:
+                if isinstance(item, bool) or not isinstance(item, int):
+                    self._send_json(400, {"error": "all items must be integer type_ids"})
+                    return None
+                if item < 0 or item > (1 << 63) - 1:
+                    self._send_json(400, {"error": "type_id out of int64 range"})
+                    return None
+                out.append(item)
+            if not out:
+                self._send_json(400, {"error": "empty type_id list"})
+                return None
+            return out
+
+        def do_POST(self):  # noqa: N802
+            url = urlsplit(self.path)
+            parts = [p for p in url.path.split("/") if p]
+            if not parts:
+                return self._send_json(404, {"error": "not found", "path": self.path})
+            head = parts[0]
+
+            if head == "stats" and len(parts) == 2:
+                lid = self._parse_int(parts[1])
+                if lid is None:
+                    return self._send_json(400, {"error": "invalid location_id"})
+                info = state.resolver.classify(lid)
+                if info.kind == "unknown":
+                    return self._send_json(404, {"error": "unknown location"})
+                snap_path = latest_snapshot_path(state.data_dir)
+                if snap_path is None:
+                    return self._send_json(503, {"error": "no snapshots yet"})
+                body = self._read_body()
+                if body is None:
+                    return
+                type_ids = self._parse_type_ids(body)
+                if type_ids is None:
+                    return
+                payload = compute_live_stats(snap_path, info, type_ids)
+                return self._send_json(200, payload)
+
+            if head == "history" and len(parts) == 3:
+                lid = self._parse_int(parts[1])
+                if lid is None:
+                    return self._send_json(400, {"error": "invalid location_id"})
+                rng = parse_range(parts[2])
+                if rng is None:
+                    return self._send_json(400, {
+                        "error": "invalid range",
+                        "hint": "use <int><h|d|w|m|y>, e.g. 1h, 7d, 1w, 3m, 1y",
+                    })
+                info = state.resolver.classify(lid)
+                if info.kind == "unknown":
+                    return self._send_json(404, {"error": "unknown location"})
+                if info.kind == "structure":
+                    return self._send_json(
+                        400,
+                        {"error": "history not available for player structures (ESI is region-only)"},
+                    )
+                body = self._read_body()
+                if body is None:
+                    return
+                type_ids = self._parse_type_ids(body)
+                if type_ids is None:
+                    return
+                payload = compute_history_stats(
+                    state.data_dir, info, type_ids, rng,
+                    client=state.client,
+                )
+                return self._send_json(200, payload)
 
             return self._send_json(404, {"error": "not found", "path": self.path})
 
