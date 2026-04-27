@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-_ORDERS_RE = re.compile(r"^orders-(\d+)\.jsonl$")
+_ORDERS_RE = re.compile(r"^orders-(\d+)\.jsonl(?:\.gz)?$")
 
 
 def orders_dir(data_dir: Path) -> Path:

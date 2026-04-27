@@ -5,11 +5,12 @@ import json
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from .compression import open_jsonl
 from .location import LocationInfo
 
 
 def iter_snapshot(orders_jsonl: Path) -> Iterator[dict]:
-    with Path(orders_jsonl).open("r", encoding="utf-8") as f:
+    with open_jsonl(orders_jsonl) as f:
         for line in f:
             line = line.strip()
             if not line:

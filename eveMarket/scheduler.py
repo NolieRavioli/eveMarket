@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .collector import collect_snapshot
+from .compression import sweep_old_data
 from .esi import EsiClient
 from .inferred import diff_snapshots, is_complete, write_inferred
 from .jumps import JumpGraph
@@ -68,6 +69,12 @@ class CollectorScheduler:
             )
         except Exception:
             logger.exception("precompute failed for snapshot %s", snapshot_unix)
+        # Always try the compression sweep after precompute, so disk usage
+        # stays bounded even if the precompute step itself failed.
+        try:
+            sweep_old_data(self.data_dir)
+        except Exception:
+            logger.exception("compression sweep failed")
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -84,6 +91,13 @@ class CollectorScheduler:
         threading.Thread(
             target=self.catch_up_precompute,
             name="eveMarket-precompute-catchup",
+            daemon=True,
+        ).start()
+        # One-shot backfill: gzip any historical snapshot/inferred files that
+        # accumulated before compression existed.
+        threading.Thread(
+            target=self._startup_sweep,
+            name="eveMarket-compression-backfill",
             daemon=True,
         ).start()
         self._thread = threading.Thread(target=self._loop, name="eveMarket-scheduler",
@@ -202,3 +216,10 @@ class CollectorScheduler:
             return
         logger.info("catch_up_precompute: regenerating for snapshot %s", latest)
         self._do_precompute(latest)
+
+    def _startup_sweep(self) -> None:
+        """One-shot compression backfill for pre-existing historical files."""
+        try:
+            sweep_old_data(self.data_dir)
+        except Exception:
+            logger.exception("startup compression sweep failed")

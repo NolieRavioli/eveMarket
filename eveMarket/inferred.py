@@ -27,6 +27,7 @@ from typing import Iterable, Iterator, Optional
 from ._term import rprint
 from .esi import EsiClient
 from .history import HistoryStore, rolling_mean_volume
+from .compression import gz_sibling, open_jsonl
 from .snapshot import inferred_dir
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ def _rprint(msg: str, *, end: bool = False, client: Optional[EsiClient] = None) 
 def _index_orders(orders_jsonl: Path) -> dict[int, dict]:
     """Return ``{order_id: order_row}`` for a snapshot file."""
     out: dict[int, dict] = {}
-    with Path(orders_jsonl).open("r", encoding="utf-8") as f:
+    with open_jsonl(orders_jsonl) as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -137,7 +138,7 @@ def diff_snapshots(
         trades_found = 0
         orders_seen = 0
         t0 = time.monotonic()
-        with Path(curr_jsonl).open("r", encoding="utf-8") as f:
+        with open_jsonl(curr_jsonl) as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -276,10 +277,10 @@ def write_inferred(
 
 def load_inferred(data_dir: Path, curr_unix: int) -> Optional[list[dict]]:
     p = cache_path(data_dir, curr_unix)
-    if not p.exists():
+    if not p.exists() and not gz_sibling(p).exists():
         return None
     out: list[dict] = []
-    with p.open("r", encoding="utf-8") as f:
+    with open_jsonl(p) as f:
         for line in f:
             line = line.strip()
             if not line:
