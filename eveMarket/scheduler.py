@@ -14,6 +14,9 @@ from typing import Callable, Optional
 from .collector import collect_snapshot
 from .esi import EsiClient
 from .inferred import diff_snapshots, is_complete, write_inferred
+from .jumps import JumpGraph
+from .location import LocationResolver
+from .precompute import needs_precompute, run_precompute
 from .snapshot import latest_snapshot, previous_snapshot, orders_path
 
 logger = logging.getLogger(__name__)
@@ -39,6 +42,32 @@ class CollectorScheduler:
         self.stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._running = threading.Lock()
+        # Precompute artefacts share resolver+jumps with the HTTP server when
+        # possible (set via `attach_precompute_resources`); otherwise they are
+        # lazy-loaded on first use.
+        self._resolver: Optional[LocationResolver] = None
+        self._jumps: Optional[JumpGraph] = None
+
+    def attach_precompute_resources(
+        self,
+        resolver: Optional[LocationResolver],
+        jumps: Optional[JumpGraph],
+    ) -> None:
+        """Reuse already-loaded SDE caches to avoid double-loading them."""
+        self._resolver = resolver
+        self._jumps = jumps
+
+    def _do_precompute(self, snapshot_unix: int) -> None:
+        try:
+            run_precompute(
+                self.sde_dir, self.data_dir,
+                snapshot_unix=snapshot_unix,
+                resolver=self._resolver,
+                jumps=self._jumps,
+                client=self.client,
+            )
+        except Exception:
+            logger.exception("precompute failed for snapshot %s", snapshot_unix)
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -51,6 +80,12 @@ class CollectorScheduler:
                 name="eveMarket-infer-catchup",
                 daemon=True,
             ).start()
+        # Catch up on precomputed datasets for the latest snapshot if stale.
+        threading.Thread(
+            target=self.catch_up_precompute,
+            name="eveMarket-precompute-catchup",
+            daemon=True,
+        ).start()
         self._thread = threading.Thread(target=self._loop, name="eveMarket-scheduler",
                                         daemon=True)
         self._thread.start()
@@ -151,5 +186,19 @@ class CollectorScheduler:
                     logger.info("inferred: %s trades -> %s", n, inf_path)
                 except Exception:
                     logger.exception("inferred-trade computation failed")
+
+            # Precompute /stats + /history for the new snapshot.
+            self._do_precompute(t_unix)
         finally:
             self._running.release()
+
+    def catch_up_precompute(self) -> None:
+        """Generate precomputed datasets if missing or stale on startup."""
+        latest = latest_snapshot(self.data_dir)
+        if latest is None:
+            return
+        if not needs_precompute(self.data_dir, latest):
+            logger.info("catch_up_precompute: meta is up-to-date for %s", latest)
+            return
+        logger.info("catch_up_precompute: regenerating for snapshot %s", latest)
+        self._do_precompute(latest)

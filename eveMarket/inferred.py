@@ -67,6 +67,31 @@ def _trade_location(order: dict) -> Optional[int]:
     return None if loc is None else int(loc)
 
 
+def _emit_trade(order: dict, *, actual: bool, order_id: int, volume: float) -> dict:
+    """Build an inferred-trade record with scope context for attribution.
+
+    Always includes ``system_id``, ``buyer_range``, ``buyer_station_id`` so that
+    downstream consumers can attribute non-station-range buy fills to the
+    correct system / constellation / region scope (and optionally estimate
+    station-level shares).
+    """
+    is_buy = bool(order.get("is_buy_order"))
+    raw_loc = order.get("location_id")
+    return {
+        "actual": actual,
+        "order_id": order_id,
+        "type_id": order.get("type_id"),
+        "region_id": order.get("region_id"),
+        "system_id": order.get("system_id"),
+        "is_buy_order": is_buy,
+        "price": order.get("price"),
+        "volume": volume,
+        "location_id": _trade_location(order),
+        "buyer_range": order.get("range") if is_buy else None,
+        "buyer_station_id": int(raw_loc) if (is_buy and raw_loc is not None) else None,
+    }
+
+
 def diff_snapshots(
     prev_jsonl: Path,
     curr_jsonl: Path,
@@ -143,16 +168,7 @@ def diff_snapshots(
                 delta = vp - vc
                 if delta > 0:
                     trades_found += 1
-                    yield {
-                        "actual": True,
-                        "order_id": oid,
-                        "type_id": row.get("type_id"),
-                        "region_id": row.get("region_id"),
-                        "is_buy_order": bool(row.get("is_buy_order")),
-                        "price": row.get("price"),
-                        "volume": delta,
-                        "location_id": _trade_location(row),
-                    }
+                    yield _emit_trade(row, actual=True, order_id=oid, volume=delta)
         _rprint(
             f"[pass1] partial-fill scan. orders: {orders_seen:,}. trades: {trades_found:,}",
             end=True,
@@ -190,16 +206,7 @@ def diff_snapshots(
             if threshold <= 0 or vp > threshold:
                 continue
             trades_found += 1
-            yield {
-                "actual": False,
-                "order_id": oid,
-                "type_id": tid,
-                "region_id": rid,
-                "is_buy_order": bool(prev_row.get("is_buy_order")),
-                "price": prev_row.get("price"),
-                "volume": vp,
-                "location_id": _trade_location(prev_row),
-            }
+            yield _emit_trade(prev_row, actual=False, order_id=oid, volume=vp)
         _rprint(
             f"[pass2] removed-order check. {total_removed}/{total_removed}. ETA 0m 00s. trades: {trades_found:,}",
             end=True,

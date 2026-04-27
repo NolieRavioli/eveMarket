@@ -175,6 +175,63 @@ def latest_snapshot_path(data_dir: Path) -> Optional[Path]:
     return orders_path(data_dir, snap)
 
 
+def compute_live_stats_with_attribution(
+    snapshot_path: Path,
+    target_station_id: int,
+    type_ids: Iterable[int],
+    *,
+    resolver: LocationResolver,
+    jumps,
+) -> dict[str, dict]:
+    """Live stats for a station with jump-weighted buy-side attribution.
+
+    Sell side: exact-only (sell orders always carry concrete location_id).
+    Buy side: includes exact station-range buys at the target plus
+    fractionally-attributed shares of non-station-range buys reachable to
+    the target station. The response carries an ``attribution`` annotation.
+    """
+    # Local import to avoid a circular import at module load time.
+    from .attribution import estimated_buy_orders_for_station
+
+    wanted = sorted({int(t) for t in type_ids})
+    info = resolver.classify(int(target_station_id))
+    base = compute_live_stats(snapshot_path, info, wanted)
+
+    estimated = estimated_buy_orders_for_station(
+        snapshot_path,
+        target_station_id=int(target_station_id),
+        type_ids=wanted,
+        resolver=resolver,
+        jumps=jumps,
+        use_liquidity_bias=True,
+    )
+
+    out: dict[str, dict] = {}
+    for tid in wanted:
+        key = str(tid)
+        rec = base.get(key, {"buy": _weighted_stats_buy_side([]),
+                              "sell": _weighted_stats([])})
+        est_rows = estimated.get(int(tid), [])
+        est_volume = sum(v for _, v in est_rows)
+        # Re-blend buy side with estimated rows for an attributed view.
+        try:
+            exact_volume = float(rec["buy"]["volume"])
+        except (TypeError, ValueError, KeyError):
+            exact_volume = 0.0
+        try:
+            exact_orders = int(rec["buy"]["orderCount"])
+        except (TypeError, ValueError, KeyError):
+            exact_orders = 0
+        rec["buy"]["exact_volume"] = f"{exact_volume:.1f}"
+        rec["buy"]["estimated_volume"] = f"{est_volume:.1f}"
+        rec["buy"]["volume"] = f"{exact_volume + est_volume:.1f}"
+        rec["buy"]["estimated_order_count"] = str(len(est_rows))
+        rec["buy"]["orderCount"] = str(exact_orders + len(est_rows))
+        rec["attribution"] = "jump_weighted"
+        out[key] = rec
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Historic stats via /markets/{region_id}/history/
 # ---------------------------------------------------------------------------

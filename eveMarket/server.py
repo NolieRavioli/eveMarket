@@ -22,7 +22,14 @@ from urllib.parse import parse_qs, urlsplit
 from .esi import EsiClient
 from .index import filter_snapshot, iter_snapshot, matches
 from .inferred import diff_snapshots, load_inferred
+from .jumps import JumpGraph
 from .location import LocationResolver
+from .precompute import (
+    history_file as precomputed_history_file,
+    read_meta as read_precomputed_meta,
+    stats_attr_file as precomputed_stats_attr_file,
+    stats_file as precomputed_stats_file,
+)
 from .snapshot import (
     find_nearest_snapshot,
     latest_snapshot,
@@ -33,9 +40,11 @@ from .snapshot import (
 from .stats import (
     compute_history_stats,
     compute_live_stats,
+    compute_live_stats_with_attribution,
     latest_snapshot_path,
     parse_range,
 )
+from .attribution import estimated_inferred_for_station
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +61,7 @@ class MarketState:
         self.data_dir = Path(data_dir)
         self.client = client or EsiClient()
         self.resolver = LocationResolver(self.sde_dir)
+        self.jumps = JumpGraph(self.sde_dir)
 
 
 def _make_handler(state: MarketState):
@@ -107,9 +117,10 @@ def _make_handler(state: MarketState):
                 return self._send_json(200, {"service": "eveMarket", "see": [
                     "/health",
                     "/currentOrders/{location_id}",
+                    "/orders                       (entire latest snapshot)",
                     "/orders/{unix_time}[?location=<id>]",
-                    "/inferred/{location_id}",
-                    "POST /stats/{location_id}  body: [type_id, ...]",
+                    "/inferred/{location_id}[?attribution=jump_weighted]",
+                    "POST /stats/{location_id}[?attribution=jump_weighted]  body: [type_id, ...]",
                     "POST /history/{location_id}/{range}  body: [type_id, ...]",
                 ]})
 
@@ -134,6 +145,14 @@ def _make_handler(state: MarketState):
                 if info.kind == "unknown":
                     return self._send_json(404, {"error": "unknown location"})
                 return self._send_ndjson(filter_snapshot(orders_path(state.data_dir, latest), info))
+
+            if head == "orders" and len(parts) == 1:
+                latest = latest_snapshot(state.data_dir)
+                if latest is None:
+                    return self._send_json(503, {"error": "no snapshots yet"})
+                snap_path = orders_path(state.data_dir, latest)
+                return self._send_ndjson(iter_snapshot(snap_path),
+                                         extra_headers={"X-Snapshot-Unix": latest})
 
             if head == "orders" and len(parts) == 2:
                 t = self._parse_int(parts[1])
@@ -165,19 +184,45 @@ def _make_handler(state: MarketState):
                 info = state.resolver.classify(lid)
                 if info.kind == "unknown":
                     return self._send_json(404, {"error": "unknown location"})
+                attribution = (qs.get("attribution", [None])[0] or "").lower() or None
+                if attribution and attribution != "jump_weighted":
+                    return self._send_json(400, {"error": "unknown attribution mode",
+                                                  "hint": "use attribution=jump_weighted"})
+                if attribution == "jump_weighted" and info.kind != "station":
+                    return self._send_json(400, {
+                        "error": "attribution=jump_weighted requires a station scope",
+                    })
+
+                # Build the base inferred-trade source (cached file or live diff).
                 cached = load_inferred(state.data_dir, latest)
                 if cached is not None:
-                    rows = (t for t in cached if _trade_matches(t, info, state.resolver))
-                    return self._send_ndjson(rows)
-                prev = previous_snapshot(state.data_dir, latest)
-                if prev is None:
-                    return self._send_json(503, {"error": "need at least 2 snapshots"})
-                trades = diff_snapshots(orders_path(state.data_dir, prev),
-                                        orders_path(state.data_dir, latest),
-                                        data_dir=state.data_dir,
-                                        client=state.client)
-                rows = (t for t in trades if _trade_matches(t, info, state.resolver))
-                return self._send_ndjson(rows)
+                    source_iter = iter(cached)
+                else:
+                    prev = previous_snapshot(state.data_dir, latest)
+                    if prev is None:
+                        return self._send_json(503, {"error": "need at least 2 snapshots"})
+                    source_iter = diff_snapshots(
+                        orders_path(state.data_dir, prev),
+                        orders_path(state.data_dir, latest),
+                        data_dir=state.data_dir,
+                        client=state.client,
+                    )
+
+                if attribution == "jump_weighted":
+                    rows = estimated_inferred_for_station(
+                        source_iter,
+                        target_station_id=lid,
+                        resolver=state.resolver,
+                        jumps=state.jumps,
+                        liquidity_index=None,
+                    )
+                    return self._send_ndjson(rows, extra_headers={
+                        "X-Attribution": "jump_weighted",
+                        "X-Snapshot-Unix": latest,
+                    })
+
+                rows = (t for t in source_iter if _trade_matches(t, info, state.resolver))
+                return self._send_ndjson(rows, extra_headers={"X-Snapshot-Unix": latest})
 
             return self._send_json(404, {"error": "not found", "path": self.path})
 
@@ -238,16 +283,56 @@ def _make_handler(state: MarketState):
                 info = state.resolver.classify(lid)
                 if info.kind == "unknown":
                     return self._send_json(404, {"error": "unknown location"})
-                snap_path = latest_snapshot_path(state.data_dir)
-                if snap_path is None:
-                    return self._send_json(503, {"error": "no snapshots yet"})
+                attribution = (urlsplit(self.path).query and
+                               parse_qs(urlsplit(self.path).query).get(
+                                   "attribution", [None])[0]) or None
+                if attribution:
+                    attribution = attribution.lower()
+                if attribution and attribution != "jump_weighted":
+                    return self._send_json(400, {"error": "unknown attribution mode",
+                                                  "hint": "use attribution=jump_weighted"})
+                if attribution == "jump_weighted" and info.kind != "station":
+                    return self._send_json(400, {
+                        "error": "attribution=jump_weighted requires a station scope",
+                    })
                 body = self._read_body()
                 if body is None:
                     return
                 type_ids = self._parse_type_ids(body)
                 if type_ids is None:
                     return
-                payload = compute_live_stats(snap_path, info, type_ids)
+
+                # Try to serve from precomputed files first. Regions and NPC
+                # stations are precomputed; constellation/system/structure
+                # fall back to live compute.
+                precomputed_path = None
+                empty_template = _empty_strict_record
+                if attribution == "jump_weighted" and info.kind == "station":
+                    precomputed_path = precomputed_stats_attr_file(state.data_dir, lid)
+                    empty_template = _empty_attr_record
+                elif info.kind in ("region", "station"):
+                    precomputed_path = precomputed_stats_file(state.data_dir, lid)
+
+                file_payload = _load_precomputed_json(precomputed_path) if precomputed_path else None
+                if file_payload is not None:
+                    out = {}
+                    for tid in type_ids:
+                        key = str(tid)
+                        out[key] = file_payload.get(key) or empty_template()
+                    return self._send_json(200, out)
+
+                # Fallback: live compute (covers constellations, systems, and
+                # the gap before the first precompute cycle finishes).
+                snap_path = latest_snapshot_path(state.data_dir)
+                if snap_path is None:
+                    return self._send_json(503, {"error": "no snapshots yet"})
+                if attribution == "jump_weighted":
+                    payload = compute_live_stats_with_attribution(
+                        snap_path, lid, type_ids,
+                        resolver=state.resolver, jumps=state.jumps,
+                    )
+                else:
+                    payload = compute_live_stats(snap_path, info, type_ids)
                 return self._send_json(200, payload)
 
             if head == "history" and len(parts) == 3:
@@ -274,6 +359,28 @@ def _make_handler(state: MarketState):
                 type_ids = self._parse_type_ids(body)
                 if type_ids is None:
                     return
+
+                # Precomputed history files exist per (region, fixed range).
+                # Resolve scope to its single region (multi-region scopes are
+                # rare; only kind="region"/"constellation"/"system"/"station"
+                # are valid here, and each maps to exactly one region for the
+                # purposes of /history).
+                range_label = _PRECOMPUTED_HISTORY_RANGES.get(rng)
+                region_ids = sorted(info.region_ids)
+                if range_label and len(region_ids) == 1:
+                    rid = region_ids[0]
+                    file_payload = _load_precomputed_json(
+                        precomputed_history_file(state.data_dir, rid, range_label)
+                    )
+                    if file_payload is not None:
+                        out = {}
+                        for tid in type_ids:
+                            key = str(tid)
+                            out[key] = file_payload.get(key) or _empty_history_record(rng)
+                        return self._send_json(200, out)
+
+                # Fallback: live compute (custom ranges, multi-region scopes,
+                # or precompute hasn't run yet).
                 payload = compute_history_stats(
                     state.data_dir, info, type_ids, rng,
                     client=state.client,
@@ -285,18 +392,108 @@ def _make_handler(state: MarketState):
     return Handler
 
 
+# ---------------------------------------------------------------------------
+# Precomputed-file helpers (used by POST /stats and POST /history)
+# ---------------------------------------------------------------------------
+_EMPTY_SIDE_STRICT = {
+    "weightedAverage": "0", "max": "0", "min": "0", "stddev": "0",
+    "median": "0", "volume": "0", "orderCount": "0", "percentile": "0",
+}
+
+
+def _empty_strict_record() -> dict:
+    return {"buy": dict(_EMPTY_SIDE_STRICT), "sell": dict(_EMPTY_SIDE_STRICT)}
+
+
+def _empty_attr_record() -> dict:
+    buy = dict(_EMPTY_SIDE_STRICT)
+    buy["exact_volume"] = "0.0"
+    buy["estimated_volume"] = "0.0"
+    buy["estimated_order_count"] = "0"
+    return {"buy": buy, "sell": dict(_EMPTY_SIDE_STRICT),
+            "attribution": "jump_weighted"}
+
+
+def _empty_history_record(range_seconds: int) -> dict:
+    return {
+        "average": 0.0, "date": "", "range": int(range_seconds),
+        "highest": 0.0, "lowest": 0.0, "order_count": 0, "volume": 0,
+    }
+
+
+def _load_precomputed_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+# Fixed history ranges that match precompute.HISTORY_RANGES.
+_PRECOMPUTED_HISTORY_RANGES: dict[int, str] = {
+    86_400: "1d",
+    604_800: "7d",
+    2_592_000: "30d",
+    7_776_000: "90d",
+    31_536_000: "1y",
+}
+
+
 def _trade_matches(trade: dict, info, resolver: LocationResolver) -> bool:
-    """Reuse the order matcher: trade rows carry region_id + location_id."""
+    """Reuse the order matcher: trade rows carry region_id + location_id.
+
+    For buy-side trades whose ``location_id`` was nulled (range > station), we
+    can still attribute exactly when the requested scope FULLY CONTAINS the
+    buyer's reachable system set: e.g. a ``solarsystem`` buy at Jita matches
+    a Jita-system query, a Forge-region query, and a Kimotoro-constellation
+    query, but NOT a station query (use ``attribution=jump_weighted`` for
+    that).
+    """
     # Fabricate an order-shaped dict so index.matches() can be reused.
     pseudo = {
         "region_id": trade.get("region_id"),
         "location_id": trade.get("location_id"),
-        "system_id": None,
+        "system_id": trade.get("system_id"),
     }
     loc = trade.get("location_id")
-    if loc is not None and 60_000_000 <= int(loc) <= 63_999_999:
+    if pseudo["system_id"] is None and loc is not None \
+            and 60_000_000 <= int(loc) <= 63_999_999:
         pseudo["system_id"] = resolver.system_of_station.get(int(loc))
-    return matches(pseudo, info)
+    if matches(pseudo, info):
+        return True
+
+    # Fallback: null location_id buy-side trade with known buyer scope.
+    if loc is not None or info.kind in ("station", "structure", "unknown"):
+        return False
+    rng = trade.get("buyer_range")
+    bsid = trade.get("buyer_station_id")
+    if rng is None or bsid is None:
+        return False
+    buyer_sys = resolver.system_of_station.get(int(bsid))
+    if buyer_sys is None:
+        return False
+    buyer_region = resolver.region_for_system(buyer_sys)
+
+    rng_str = str(rng).lower()
+    if rng_str == "solarsystem":
+        # Buyer fills only in their own system.
+        if info.kind == "system":
+            return buyer_sys in info.system_ids
+        if info.kind == "constellation":
+            return buyer_sys in info.system_ids
+        if info.kind == "region":
+            return buyer_region in info.region_ids
+        return False
+    if rng_str == "region":
+        # Buyer fills anywhere in their region.
+        if info.kind in ("region", "constellation", "system"):
+            return buyer_region is not None and buyer_region in info.region_ids
+        return False
+    # constellation / numeric ranges: only safe when the requested scope is
+    # the whole region (a strict superset of any sub-region buy reach).
+    if info.kind == "region":
+        return buyer_region is not None and buyer_region in info.region_ids
+    return False
 
 
 def serve(

@@ -58,6 +58,15 @@ Errors:
 - `404` unknown location
 - `503` no snapshots yet
 
+### GET /orders
+
+Returns the **entire latest snapshot** as NDJSON (every region, every order).
+Response header `X-Snapshot-Unix` carries the snapshot timestamp.
+
+Errors:
+
+- `503` no snapshots yet
+
 ### GET /orders/{unix_time}
 
 Returns orders from the snapshot nearest to `unix_time`.
@@ -91,11 +100,45 @@ Behavior:
 - If cached inferred file exists for the latest snapshot, it streams that.
 - Otherwise, it computes inferred trades from the previous and latest snapshots.
 
+Response header `X-Snapshot-Unix` carries the snapshot timestamp.
+
+Optional query:
+
+- `?attribution=jump_weighted` (station scope only) — see
+  [Jump-weighted attribution](#jump-weighted-attribution) below.
+
 Errors:
 
-- `400` invalid location id
+- `400` invalid location id, or `attribution=jump_weighted` requested for a
+  non-station scope, or unknown attribution mode
 - `404` unknown location
 - `503` no snapshots yet, or fewer than 2 snapshots available
+
+#### Jump-weighted attribution
+
+Non-station-range buy orders fill from multiple stations; the exact fill
+station is unknowable from snapshots. By default such trades carry
+`location_id: null` and are excluded from station-scope queries.
+
+With `?attribution=jump_weighted`, station-scope `/inferred` and `/stats`
+requests synthesize estimated contributions from those trades using:
+
+```
+weight(s) = (1 / (1 + jumps(buyer_system, system_of(s)))) * sell_volume(type, s)
+share(s)  = weight(s) / sum(weight)
+```
+
+The sell-side liquidity term biases shares toward stations that actually have
+offers for the type (where buyers realistically fill). Estimated trades are
+emitted alongside exact trades with the additional fields:
+
+- `estimated: true`
+- `attribution: "jump_weighted"`
+- `attribution_share: <float>`
+
+Response headers also include `X-Attribution: jump_weighted`.
+
+This mode is opt-in only; default behavior is unchanged.
 
 ### POST /stats/{location_id}
 
@@ -130,6 +173,11 @@ Notes:
 - `percentile` is the 5th percentile of sell prices and the 95th percentile of
   buy prices (i.e., the "best realistic" prices on each side).
 - All numeric fields are returned as strings to preserve precision.
+- Optional query `?attribution=jump_weighted` (station scope only) adds
+  fractionally-attributed buy-side volume from non-station-range buys reachable
+  to the station. The response gains an `attribution: "jump_weighted"` field
+  per type and the buy side adds `exact_volume`, `estimated_volume`, and
+  `estimated_order_count` alongside the (now-combined) `volume` / `orderCount`.
 
 Errors:
 
@@ -193,7 +241,17 @@ Default under `./data`:
 - `orders/orders-<unix>.jsonl` snapshot files
 - `inferred/infer-<unix>.jsonl` inferred trade cache
 - `history/region-<id>.json` market history cache
+- `precomputed/meta.json` snapshot_unix + generation timestamp + counts
+- `precomputed/stats/<location_id>.json` strict stats per region / NPC station
+- `precomputed/stats_attr/<station_id>.json` jump-weighted stats per NPC station
+- `precomputed/history/<region_id>_<range>.json` aggregated history (1d, 7d, 30d, 90d, 1y)
 
 A completion marker is written after inferred processing:
 
 - `inferred/infer-<unix>.done`
+
+After every collection cycle the scheduler regenerates everything under
+`precomputed/` from the new snapshot, so `POST /stats` and `POST /history`
+become near-instant file reads (filtered by the request's `type_ids` body).
+Custom history ranges and constellation/system scopes still fall back to
+live computation.
