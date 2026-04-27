@@ -4,6 +4,12 @@ eveMarket runs a market snapshot collector and an HTTP API server.
 
 Default bind: `0.0.0.0:13307`
 
+## Prerequisites
+
+```bash
+pip install -r requirements.txt
+```
+
 ## Start
 
 ```bash
