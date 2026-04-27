@@ -13,7 +13,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "eveMarket/1.0 (+https://github.com/NolieRavioli/eve-god-sheet-code)"
+USER_AGENT = "eveMarket/1.0 (+https://github.com/NolieRavioli/eveMarket)"
 
 
 def _parse_limit_header(value: Optional[str]) -> tuple[Optional[int], Optional[int]]:
