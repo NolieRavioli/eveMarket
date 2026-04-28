@@ -27,6 +27,7 @@ from .location import LocationResolver
 from .precompute import (
     history_file as precomputed_history_file,
     history_station_file as precomputed_history_station_file,
+    precomputed_dir,
     read_meta as read_precomputed_meta,
     stats_attr_file as precomputed_stats_attr_file,
     stats_file as precomputed_stats_file,
@@ -121,6 +122,7 @@ def _make_handler(state: MarketState):
                     "/orders                       (entire latest snapshot)",
                     "/orders/{unix_time}[?location=<id>]",
                     "/inferred/{location_id}[?attribution=jump_weighted]",
+                    "/history/{range}              (NDJSON: every precomputed region+station for this range)",
                     "POST /stats/{location_id}[?attribution=jump_weighted]  body: [type_id, ...]",
                     "POST /history/{location_id}/{range}  body: [type_id, ...]",
                 ]})
@@ -224,6 +226,31 @@ def _make_handler(state: MarketState):
 
                 rows = (t for t in source_iter if _trade_matches(t, info, state.resolver))
                 return self._send_ndjson(rows, extra_headers={"X-Snapshot-Unix": latest})
+
+            if head == "history" and len(parts) == 2:
+                rng = parse_range(parts[1])
+                if rng is None:
+                    return self._send_json(400, {
+                        "error": "invalid range",
+                        "hint": "use one of " + ", ".join(
+                            sorted(_PRECOMPUTED_HISTORY_RANGES.values())
+                        ),
+                    })
+                range_label = _PRECOMPUTED_HISTORY_RANGES.get(rng)
+                if range_label is None:
+                    return self._send_json(400, {
+                        "error": "range not precomputed",
+                        "hint": "use one of " + ", ".join(
+                            sorted(_PRECOMPUTED_HISTORY_RANGES.values())
+                        ),
+                    })
+                meta = read_precomputed_meta(state.data_dir)
+                snap_unix = (meta or {}).get("snapshot_unix")
+                rows = _iter_universe_history(state.data_dir, range_label)
+                extra = {"X-History-Range": range_label}
+                if snap_unix is not None:
+                    extra["X-Snapshot-Unix"] = snap_unix
+                return self._send_ndjson(rows, extra_headers=extra)
 
             return self._send_json(404, {"error": "not found", "path": self.path})
 
@@ -431,6 +458,44 @@ def _load_precomputed_json(path):
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return None
+
+
+def _iter_universe_history(data_dir: Path, range_label: str):
+    """Yield one NDJSON row per precomputed location for the given range.
+
+    Walks ``precomputed/history/`` (regions) and ``precomputed/history_station/``
+    (NPC stations) for files matching ``*_{range_label}.json``. Each row::
+
+        {"scope": "region"|"station",
+         "location_id": <int>,
+         "range": "<label>",
+         "types": {"<type_id>": {"buy": {...}, "sell": {...}}, ...}}
+    """
+    suffix = f"_{range_label}.json"
+    base = precomputed_dir(data_dir)
+    for scope, sub in (("region", "history"), ("station", "history_station")):
+        d = base / sub
+        if not d.is_dir():
+            continue
+        # Sorted for stable streaming order; not required for correctness.
+        for entry in sorted(d.iterdir()):
+            name = entry.name
+            if not name.endswith(suffix) or not entry.is_file():
+                continue
+            stem = name[:-len(suffix)]
+            try:
+                lid = int(stem)
+            except ValueError:
+                continue
+            payload = _load_precomputed_json(entry)
+            if not payload:
+                continue
+            yield {
+                "scope": scope,
+                "location_id": lid,
+                "range": range_label,
+                "types": payload,
+            }
 
 
 # Fixed history ranges that match precompute.HISTORY_RANGES.
