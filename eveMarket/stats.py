@@ -336,62 +336,100 @@ def compute_history_stats(
     *,
     client: Optional[EsiClient] = None,
 ) -> dict[str, dict]:
-    """Per-type aggregated history record. ESI is region-only; we report region data."""
+    """Per-type aggregated history (live fallback) using inferred trades.
+
+    Returns the same ``{"buy": {...}, "sell": {...}}`` shape as ``/stats``.
+    Used when the requested range/scope isn't covered by the precomputed
+    files. ``info`` selects which trades are included:
+
+    - ``region`` / ``constellation`` / ``system`` / ``station``: bucket trades
+      whose ``region_id`` (or ``location_id`` for station scope) matches.
+    - ``structure`` / ``unknown``: empty payload.
+    """
+    # Local imports to avoid circulars at module load.
+    from .compression import _inferred_jsonl_path, _list_inferred_unix, open_jsonl
+
     wanted = sorted({int(t) for t in type_ids})
     if not wanted:
         return {}
-    regions = _regions_for(info)
-    if not regions:
-        return {str(t): None for t in wanted}  # type: ignore[dict-item]
+    if info.kind in ("structure", "unknown"):
+        return {str(t): {"buy": _weighted_stats_buy_side([]),
+                         "sell": _weighted_stats([])} for t in wanted}
 
-    store = HistoryStore(data_dir, client=client)
-    out: dict[str, dict] = {}
-    try:
-        for tid in wanted:
-            # Merge daily rows across all regions in scope (constellation/system
-            # within a single region == 1 region; for multi-region scopes we
-            # sum daily counts across regions, which is the only sensible
-            # aggregation for a station-agnostic ESI feed).
-            merged: dict[str, dict] = {}
-            for rid in regions:
-                rows = store.get(rid, tid, progress=False)
-                for r in rows:
-                    d = r.get("date")
-                    if not d:
-                        continue
-                    cur = merged.get(d)
-                    if cur is None:
-                        merged[d] = dict(r)
+    region_ids = set(info.region_ids)
+    station_id = int(info.location_id) if info.kind == "station" else None
+    # constellation/system: any trade in the region whose location is inside
+    # the configured system set.
+    system_set: Optional[set[int]] = None
+    if info.kind in ("constellation", "system"):
+        system_set = {int(s) for s in (info.system_ids or set())}
+
+    wanted_set = set(wanted)
+    now = int(time.time())
+    cutoff = now - int(range_seconds)
+    inferred_unix = [u for u in _list_inferred_unix(data_dir) if u >= cutoff]
+
+    # type_id -> (buy_rows, sell_rows)
+    buckets: dict[int, tuple[list[tuple[float, float]], list[tuple[float, float]]]] = {
+        t: ([], []) for t in wanted
+    }
+
+    import json as _json
+    for unix in inferred_unix:
+        path = _inferred_jsonl_path(data_dir, unix)
+        try:
+            with open_jsonl(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
                         continue
                     try:
-                        cur["volume"] = float(cur.get("volume", 0)) + float(r.get("volume", 0))
-                        cur["order_count"] = int(cur.get("order_count", 0)) + int(r.get("order_count", 0))
-                        cur["highest"] = max(float(cur.get("highest", 0)), float(r.get("highest", 0)))
-                        cur["lowest"] = min(float(cur.get("lowest", 1e30)), float(r.get("lowest", 1e30)))
-                        # Volume-weighted re-blend of daily averages.
-                        v_a = float(r.get("volume", 0))
-                        v_b = float(cur.get("volume", 0))
-                        a_a = float(r.get("average", 0))
-                        a_b = float(cur.get("average", 0))
-                        denom = (v_a + v_b)
-                        cur["average"] = ((a_a * v_a + a_b * v_b) / denom) if denom > 0 else a_b
+                        row = _json.loads(line)
+                        tid = int(row.get("type_id"))
+                    except (TypeError, ValueError, _json.JSONDecodeError):
+                        continue
+                    if tid not in wanted_set:
+                        continue
+                    rid = row.get("region_id")
+                    try:
+                        rid_i = int(rid) if rid is not None else None
+                    except (TypeError, ValueError):
+                        rid_i = None
+                    if rid_i is None or rid_i not in region_ids:
+                        continue
+                    if station_id is not None:
+                        loc = row.get("location_id")
+                        try:
+                            loc_i = int(loc) if loc is not None else None
+                        except (TypeError, ValueError):
+                            loc_i = None
+                        if loc_i != station_id:
+                            continue
+                    elif system_set is not None:
+                        sys_i = row.get("system_id")
+                        try:
+                            sys_v = int(sys_i) if sys_i is not None else None
+                        except (TypeError, ValueError):
+                            sys_v = None
+                        if sys_v is None or sys_v not in system_set:
+                            continue
+                    try:
+                        price = float(row.get("price", 0))
+                        vol = float(row.get("volume", 0))
                     except (TypeError, ValueError):
                         continue
-            agg = _aggregate_history(list(merged.values()), int(range_seconds))
-            out[str(tid)] = agg if agg is not None else {
-                "average": 0.0,
-                "date": "",
-                "range": int(range_seconds),
-                "highest": 0.0,
-                "lowest": 0.0,
-                "order_count": 0,
-                "volume": 0,
-            }
-    finally:
-        try:
-            n_flushed = store.flush_all()
-            if n_flushed:
-                logger.info("history (api): flushed %s region cache file(s)", n_flushed)
-        except Exception:
-            logger.exception("history flush_all failed")
+                    if price <= 0 or vol <= 0:
+                        continue
+                    pair = buckets[tid]
+                    (pair[0] if row.get("is_buy_order") else pair[1]).append((price, vol))
+        except FileNotFoundError:
+            continue
+
+    out: dict[str, dict] = {}
+    for tid in wanted:
+        buy_rows, sell_rows = buckets[tid]
+        out[str(tid)] = {
+            "buy": _weighted_stats_buy_side(buy_rows),
+            "sell": _weighted_stats(sell_rows),
+        }
     return out

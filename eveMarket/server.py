@@ -26,6 +26,7 @@ from .jumps import JumpGraph
 from .location import LocationResolver
 from .precompute import (
     history_file as precomputed_history_file,
+    history_station_file as precomputed_history_station_file,
     read_meta as read_precomputed_meta,
     stats_attr_file as precomputed_stats_attr_file,
     stats_file as precomputed_stats_file,
@@ -360,24 +361,30 @@ def _make_handler(state: MarketState):
                 if type_ids is None:
                     return
 
-                # Precomputed history files exist per (region, fixed range).
-                # Resolve scope to its single region (multi-region scopes are
-                # rare; only kind="region"/"constellation"/"system"/"station"
-                # are valid here, and each maps to exactly one region for the
-                # purposes of /history).
+                # Precomputed history files exist per (region, fixed range)
+                # and per (NPC station, fixed range). Prefer station scope when
+                # the request targets one; otherwise use region scope.
                 range_label = _PRECOMPUTED_HISTORY_RANGES.get(rng)
                 region_ids = sorted(info.region_ids)
-                if range_label and len(region_ids) == 1:
-                    rid = region_ids[0]
-                    file_payload = _load_precomputed_json(
-                        precomputed_history_file(state.data_dir, rid, range_label)
-                    )
-                    if file_payload is not None:
-                        out = {}
-                        for tid in type_ids:
-                            key = str(tid)
-                            out[key] = file_payload.get(key) or _empty_history_record(rng)
-                        return self._send_json(200, out)
+                file_payload = None
+                if range_label:
+                    if info.kind == "station":
+                        file_payload = _load_precomputed_json(
+                            precomputed_history_station_file(
+                                state.data_dir, lid, range_label,
+                            )
+                        )
+                    if file_payload is None and len(region_ids) == 1:
+                        rid = region_ids[0]
+                        file_payload = _load_precomputed_json(
+                            precomputed_history_file(state.data_dir, rid, range_label)
+                        )
+                if file_payload is not None:
+                    out = {}
+                    for tid in type_ids:
+                        key = str(tid)
+                        out[key] = file_payload.get(key) or _empty_history_record(rng)
+                    return self._send_json(200, out)
 
                 # Fallback: live compute (custom ranges, multi-region scopes,
                 # or precompute hasn't run yet).
@@ -415,10 +422,7 @@ def _empty_attr_record() -> dict:
 
 
 def _empty_history_record(range_seconds: int) -> dict:
-    return {
-        "average": 0.0, "date": "", "range": int(range_seconds),
-        "highest": 0.0, "lowest": 0.0, "order_count": 0, "volume": 0,
-    }
+    return {"buy": dict(_EMPTY_SIDE_STRICT), "sell": dict(_EMPTY_SIDE_STRICT)}
 
 
 def _load_precomputed_json(path):
@@ -431,11 +435,9 @@ def _load_precomputed_json(path):
 
 # Fixed history ranges that match precompute.HISTORY_RANGES.
 _PRECOMPUTED_HISTORY_RANGES: dict[int, str] = {
-    86_400: "1d",
     604_800: "7d",
+    1_209_600: "14d",
     2_592_000: "30d",
-    7_776_000: "90d",
-    31_536_000: "1y",
 }
 
 

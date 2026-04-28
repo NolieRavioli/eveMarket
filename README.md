@@ -348,10 +348,13 @@ With `?attribution=jump_weighted` the buy side gains extra fields and a top-leve
 
 ### `POST /history/{location_id}/{range}`
 
-Historic market statistics aggregated from ESI's per-region daily history feed.
+Historic market statistics aggregated from this server's inferred-trade tape.
+Identical shape to `/stats` so callers can use the same parser.
 
-Served from precomputed files for the five fixed ranges and single-region scopes (fast);
-falls back to live aggregation for custom ranges or multi-region scopes.
+Served from precomputed files for the three fixed ranges (fast); for stations
+the per-station file is used, otherwise the parent region file. Falls back to
+live aggregation for custom ranges, system/constellation scopes, or before the
+first precompute cycle finishes.
 
 ```
 POST /history/10000002/30d
@@ -365,46 +368,36 @@ Content-Type: application/json
 
 | Param | Format | Examples |
 |-------|--------|---------|
-| `{range}` | `<int><h\|d\|w\|m\|y>` | `1h`, `7d`, `30d`, `90d`, `1y`, `644h` |
+| `{range}` | `<int><h\|d\|w\|m\|y>` | `1h`, `7d`, `14d`, `30d`, `644h` |
 
 Unit meanings: `h` = hours · `d` = days · `w` = weeks · `m` = 30-day months · `y` = 365-day years.
 
-Precomputed ranges (fast): `1d`, `7d`, `30d`, `90d`, `1y`.
-All other valid expressions are computed live.
+Precomputed ranges (fast): `7d`, `14d`, `30d`. All other valid expressions are computed live from inferred trades.
 
 **Request body** — JSON array of `type_id` integers (max 1 MiB).
 
-**Response** `200 application/json` — object keyed by stringified `type_id`:
+**Response** `200 application/json` — object keyed by stringified `type_id`. Same shape as `/stats`:
 
 ```json
 {
   "34": {
-    "average": 4.05,
-    "date": "2026-04-25",
-    "range": 2592000,
-    "highest": 4.48,
-    "lowest": 3.50,
-    "order_count": 61689,
-    "volume": 177833511249
+    "buy":  {"weightedAverage":"4.80","max":"5","min":"2.83","stddev":"0.62","median":"3.91","volume":"1092089.0","orderCount":"2","percentile":"4.89"},
+    "sell": {"weightedAverage":"4.95","max":"5.10","min":"4.80","stddev":"0.05","median":"4.95","volume":"982314.0","orderCount":"5","percentile":"4.81"}
   }
 }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `average` | float | Volume-weighted mean price over the period |
-| `date` | string | Date of the most recent included daily bucket (`YYYY-MM-DD`) |
-| `range` | int | Actual covered span in seconds (may exceed the requested range if the window extends to a daily boundary, or be shorter if history doesn't go that far back) |
-| `highest` | float | Highest daily high over the period |
-| `lowest` | float | Lowest daily low over the period |
-| `order_count` | int | Total order count over the period |
-| `volume` | int | Total units traded over the period |
+See `/stats` for full field descriptions. Volumes/order counts here are the
+total observed *trade* volume and trade-event count over the window (not
+standing-order book counts).
 
 Notes:
 
-- ESI history is region-level only. For `station`, `system`, or `constellation`
-  scopes the results reflect the parent region.
-- Types with no history in the requested window return zeroed records.
+- Region scope aggregates every inferred trade in the region over the window.
+- Station scope aggregates inferred trades whose `location_id` exactly matches
+  the station (sells always have a concrete location; buy orders with a wider
+  range have no station attribution and are excluded).
+- Types with no trades in the window return zeroed records.
 
 **Errors**
 
@@ -463,7 +456,8 @@ Default under `./data`:
 | `precomputed/meta.json` | Generation metadata (snapshot_unix, elapsed_s, counts) |
 | `precomputed/stats/<location_id>.json` | Strict order-book stats (regions + NPC stations) |
 | `precomputed/stats_attr/<station_id>.json` | Jump-weighted stats (NPC stations) |
-| `precomputed/history/<region_id>_<range>.json` | Aggregated history (ranges: 1d, 7d, 30d, 90d, 1y) |
+| `precomputed/history/<region_id>_<range>.json` | Per-region inferred-trade stats (ranges: 7d, 14d, 30d) |
+| `precomputed/history_station/<station_id>_<range>.json` | Per-NPC-station inferred-trade stats (ranges: 7d, 14d, 30d) |
 
 Historical `orders/` and `inferred/` files older than the latest 2 / 1 are
 gzipped automatically after every collection cycle (and once on startup as a

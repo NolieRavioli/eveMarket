@@ -2,10 +2,11 @@
 
 Output layout under ``data/precomputed/``::
 
-    meta.json                              global state (snapshot_unix, gen_unix, counts)
-    stats/{location_id}.json               strict stats for regions + NPC stations
-    stats_attr/{station_id}.json           jump-weighted stats for NPC stations
-    history/{region_id}_{range}.json       aggregated history for fixed ranges
+    meta.json                                   global state (snapshot_unix, gen_unix, counts)
+    stats/{location_id}.json                    strict stats for regions + NPC stations
+    stats_attr/{station_id}.json                jump-weighted stats for NPC stations
+    history/{region_id}_{range}.json            inferred-trade stats by region
+    history_station/{station_id}_{range}.json   inferred-trade stats by NPC station
 
 Endpoints become file-reads with a per-request type_id filter.
 
@@ -17,6 +18,9 @@ Pipeline (called from the scheduler after `inferred`)::
     then strict stats are written for every non-empty bucket; jump-weighted
     attribution distributes the unresolved buys across reachable NPC stations
     using ``(1/(1+jumps)) * sell_liquidity`` weights.
+
+    history is built by streaming all inferred-trade files within the
+    largest range and bucketing by region + station for each fixed range.
 """
 from __future__ import annotations
 
@@ -26,16 +30,15 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 from .esi import EsiClient
-from .history import HistoryStore
+from .compression import open_jsonl, _list_inferred_unix, _inferred_jsonl_path
 from .index import iter_snapshot
 from .jumps import JumpGraph
 from .location import LocationResolver
 from .snapshot import latest_snapshot, orders_path
 from .stats import (
-    _aggregate_history,
     _weighted_stats,
     _weighted_stats_buy_side,
 )
@@ -47,11 +50,9 @@ logger = logging.getLogger(__name__)
 # Layout
 # ---------------------------------------------------------------------------
 HISTORY_RANGES: tuple[tuple[str, int], ...] = (
-    ("1d", 86_400),
     ("7d", 604_800),
+    ("14d", 1_209_600),
     ("30d", 2_592_000),
-    ("90d", 7_776_000),
-    ("1y", 31_536_000),
 )
 
 
@@ -79,6 +80,12 @@ def _history_dir(data_dir: Path) -> Path:
     return p
 
 
+def _history_station_dir(data_dir: Path) -> Path:
+    p = precomputed_dir(data_dir) / "history_station"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def stats_file(data_dir: Path, location_id: int) -> Path:
     return _stats_dir(data_dir) / f"{int(location_id)}.json"
 
@@ -89,6 +96,10 @@ def stats_attr_file(data_dir: Path, station_id: int) -> Path:
 
 def history_file(data_dir: Path, region_id: int, range_label: str) -> Path:
     return _history_dir(data_dir) / f"{int(region_id)}_{range_label}.json"
+
+
+def history_station_file(data_dir: Path, station_id: int, range_label: str) -> Path:
+    return _history_station_dir(data_dir) / f"{int(station_id)}_{range_label}.json"
 
 
 def meta_file(data_dir: Path) -> Path:
@@ -416,56 +427,153 @@ def _write_attributed_stats(
 
 
 # ---------------------------------------------------------------------------
-# History precompute
+# History precompute (from inferred trades)
 # ---------------------------------------------------------------------------
-def _precompute_history(
-    data_dir: Path,
-    *,
-    region_ids: Iterable[int],
-    type_ids: Iterable[int],
-    client: Optional[EsiClient],
-) -> int:
-    """For each (region, range), aggregate all cached daily history rows.
+# Bucket type:  scope_id -> type_id -> (buy_rows, sell_rows)
+# Each "row" is (price, volume).
+_BucketSide = list[tuple[float, float]]
+_TypeBucket = dict[int, tuple[_BucketSide, _BucketSide]]
+_ScopeBucket = dict[int, _TypeBucket]
 
-    We never trigger ESI fetches here — ``HistoryStore`` only reads what's
-    already on disk via ``get(progress=False)``. Missing cache entries simply
-    omit that type from the precomputed file (the live endpoint can fall
-    back and fetch on demand for one-off queries).
+
+def _new_type_bucket() -> _TypeBucket:
+    return {}
+
+
+def _bucket_add(bucket: _ScopeBucket, scope_id: int, tid: int,
+                price: float, volume: float, is_buy: bool) -> None:
+    types = bucket.setdefault(scope_id, {})
+    pair = types.get(tid)
+    if pair is None:
+        pair = ([], [])
+        types[tid] = pair
+    (pair[0] if is_buy else pair[1]).append((price, volume))
+
+
+def _scope_payload(types: _TypeBucket) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for tid in sorted(types):
+        buy_rows, sell_rows = types[tid]
+        out[str(tid)] = {
+            "buy": _weighted_stats_buy_side(buy_rows),
+            "sell": _weighted_stats(sell_rows),
+        }
+    return out
+
+
+def _precompute_history(data_dir: Path) -> tuple[int, int]:
+    """Aggregate inferred trades into per-(region|station, range) stat files.
+
+    Returns ``(region_files_written, station_files_written)``.
+
+    For each fixed range in ``HISTORY_RANGES`` we build two scope buckets:
+      * region scope keyed on ``trade.region_id`` (always present)
+      * station scope keyed on ``trade.location_id`` (only NPC stations;
+        wider-range buys with ``location_id is None`` are skipped here)
+    Every trade is added to all matching ranges in a single pass.
     """
-    region_ids = sorted({int(r) for r in region_ids})
-    wanted = {int(t) for t in type_ids}
-    if not region_ids or not wanted:
-        return 0
-    store = HistoryStore(data_dir, client=client)
-    written = 0
-    for rid in region_ids:
-        # Load region cache from disk; do NOT trigger ESI fetches here.
-        region_cache = store._ensure_loaded(rid)
-        type_cache = region_cache.get("types") or {}
-        rows_by_type: dict[int, list[dict]] = {}
-        for tid_key, entry in type_cache.items():
-            try:
-                tid = int(tid_key)
-            except (TypeError, ValueError):
+    if not HISTORY_RANGES:
+        return (0, 0)
+    valid_labels = {label for label, _ in HISTORY_RANGES}
+    # Remove any stale files from previous range configurations.
+    for d in (_history_dir(data_dir), _history_station_dir(data_dir)):
+        for entry in d.iterdir():
+            if not entry.is_file() or not entry.name.endswith(".json"):
                 continue
-            if tid not in wanted:
-                continue
-            rows = entry.get("rows") if isinstance(entry, dict) else None
-            if rows:
-                rows_by_type[tid] = rows
-        if not rows_by_type:
+            stem = entry.name[:-len(".json")]
+            _, _, label = stem.rpartition("_")
+            if label and label not in valid_labels:
+                try:
+                    entry.unlink()
+                except OSError:
+                    pass
+    max_window = max(secs for _, secs in HISTORY_RANGES)
+    now = int(time.time())
+    cutoff = now - max_window
+
+    inferred_unix = [u for u in _list_inferred_unix(data_dir) if u >= cutoff]
+    if not inferred_unix:
+        return (0, 0)
+
+    # Per-range buckets.
+    region_buckets: dict[str, _ScopeBucket] = {label: {} for label, _ in HISTORY_RANGES}
+    station_buckets: dict[str, _ScopeBucket] = {label: {} for label, _ in HISTORY_RANGES}
+
+    n_trades = 0
+    n_files = 0
+    t0 = time.monotonic()
+    for unix in inferred_unix:
+        # Which ranges include this file?
+        in_ranges = [label for label, secs in HISTORY_RANGES if unix >= now - secs]
+        if not in_ranges:
             continue
-        for label, secs in HISTORY_RANGES:
-            payload: dict[str, dict] = {}
-            for tid, rows in rows_by_type.items():
-                agg = _aggregate_history(rows, secs)
-                if agg is None:
-                    continue
-                payload[str(tid)] = agg
+        path = _inferred_jsonl_path(data_dir, unix)
+        try:
+            with open_jsonl(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    try:
+                        tid = int(row.get("type_id"))
+                        price = float(row.get("price", 0))
+                        volume = float(row.get("volume", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if volume <= 0 or price <= 0:
+                        continue
+                    rid = row.get("region_id")
+                    sid = row.get("location_id")
+                    is_buy = bool(row.get("is_buy_order"))
+                    try:
+                        rid_i = int(rid) if rid is not None else None
+                    except (TypeError, ValueError):
+                        rid_i = None
+                    try:
+                        sid_i = int(sid) if sid is not None else None
+                    except (TypeError, ValueError):
+                        sid_i = None
+                    is_npc_station = (
+                        sid_i is not None and 60_000_000 <= sid_i <= 63_999_999
+                    )
+                    for label in in_ranges:
+                        if rid_i is not None:
+                            _bucket_add(region_buckets[label], rid_i, tid,
+                                        price, volume, is_buy)
+                        if is_npc_station:
+                            _bucket_add(station_buckets[label], sid_i, tid,
+                                        price, volume, is_buy)
+                    n_trades += 1
+        except FileNotFoundError:
+            continue
+        n_files += 1
+
+    region_written = 0
+    station_written = 0
+    for label, _ in HISTORY_RANGES:
+        for rid, types in region_buckets[label].items():
+            payload = _scope_payload(types)
             if payload:
                 _atomic_write_json(history_file(data_dir, rid, label), payload)
-                written += 1
-    return written
+                region_written += 1
+        for sid, types in station_buckets[label].items():
+            payload = _scope_payload(types)
+            if payload:
+                _atomic_write_json(history_station_file(data_dir, sid, label), payload)
+                station_written += 1
+
+    logger.info(
+        "precompute history: %s trades from %s inferred files in %.2fs "
+        "-> %s region files, %s station files (ranges=%s)",
+        f"{n_trades:,}", n_files, time.monotonic() - t0,
+        region_written, station_written,
+        ",".join(label for label, _ in HISTORY_RANGES),
+    )
+    return (region_written, station_written)
 
 
 # ---------------------------------------------------------------------------
@@ -519,15 +627,14 @@ def run_precompute(
     n_attr = _write_attributed_stats(data_dir, agg, estimated)
     logger.info("precompute: wrote %s jump-weighted stats files", n_attr)
 
-    n_hist = 0
+    n_hist_region = 0
+    n_hist_station = 0
     if do_history:
-        n_hist = _precompute_history(
-            data_dir,
-            region_ids=agg.region_buy.keys() | agg.region_sell.keys(),
-            type_ids=agg.all_types,
-            client=client,
+        n_hist_region, n_hist_station = _precompute_history(data_dir)
+        logger.info(
+            "precompute: wrote %s region history files, %s station history files",
+            n_hist_region, n_hist_station,
         )
-        logger.info("precompute: wrote %s history files (5 ranges x N regions)", n_hist)
 
     elapsed = time.monotonic() - t_total
     meta = {
@@ -536,7 +643,8 @@ def run_precompute(
         "elapsed_s": round(elapsed, 2),
         "strict_files": n_strict,
         "attr_files": n_attr,
-        "history_files": n_hist,
+        "history_region_files": n_hist_region,
+        "history_station_files": n_hist_station,
         "ranges": [label for label, _ in HISTORY_RANGES],
         "type_count": len(agg.all_types),
     }
