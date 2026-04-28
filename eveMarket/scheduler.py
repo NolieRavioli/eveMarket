@@ -15,7 +15,6 @@ from .collector import collect_snapshot
 from .compression import sweep_old_data
 from .esi import EsiClient
 from .inferred import diff_snapshots, is_complete, write_inferred
-from .jumps import JumpGraph
 from .location import LocationResolver
 from .precompute import needs_precompute, run_precompute
 from .snapshot import latest_snapshot, previous_snapshot, orders_path
@@ -43,20 +42,18 @@ class CollectorScheduler:
         self.stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._running = threading.Lock()
-        # Precompute artefacts share resolver+jumps with the HTTP server when
-        # possible (set via `attach_precompute_resources`); otherwise they are
+        # Precompute artefacts share the resolver with the HTTP server when
+        # possible (set via `attach_precompute_resources`); otherwise it is
         # lazy-loaded on first use.
         self._resolver: Optional[LocationResolver] = None
-        self._jumps: Optional[JumpGraph] = None
 
     def attach_precompute_resources(
         self,
         resolver: Optional[LocationResolver],
-        jumps: Optional[JumpGraph],
+        jumps=None,  # accepted for back-compat; ignored
     ) -> None:
         """Reuse already-loaded SDE caches to avoid double-loading them."""
         self._resolver = resolver
-        self._jumps = jumps
 
     def _do_precompute(self, snapshot_unix: int) -> None:
         try:
@@ -64,7 +61,6 @@ class CollectorScheduler:
                 self.sde_dir, self.data_dir,
                 snapshot_unix=snapshot_unix,
                 resolver=self._resolver,
-                jumps=self._jumps,
                 client=self.client,
             )
         except Exception:

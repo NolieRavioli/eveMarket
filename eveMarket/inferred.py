@@ -69,27 +69,23 @@ def _trade_location(order: dict) -> Optional[int]:
 
 
 def _emit_trade(order: dict, *, actual: bool, order_id: int, volume: float) -> dict:
-    """Build an inferred-trade record with scope context for attribution.
+    """Build an inferred-trade record.
 
-    Always includes ``system_id``, ``buyer_range``, ``buyer_station_id`` so that
-    downstream consumers can attribute non-station-range buy fills to the
-    correct system / constellation / region scope (and optionally estimate
-    station-level shares).
+    Buy orders whose ``range != "station"`` get ``location_id = None`` (the
+    actual filling station is unknown). Such trades still carry their
+    ``region_id``/``system_id`` so they can match region-scope queries, but
+    they will not be attributed to any specific station downstream.
     """
-    is_buy = bool(order.get("is_buy_order"))
-    raw_loc = order.get("location_id")
     return {
         "actual": actual,
         "order_id": order_id,
         "type_id": order.get("type_id"),
         "region_id": order.get("region_id"),
         "system_id": order.get("system_id"),
-        "is_buy_order": is_buy,
+        "is_buy_order": bool(order.get("is_buy_order")),
         "price": order.get("price"),
         "volume": volume,
         "location_id": _trade_location(order),
-        "buyer_range": order.get("range") if is_buy else None,
-        "buyer_station_id": int(raw_loc) if (is_buy and raw_loc is not None) else None,
     }
 
 

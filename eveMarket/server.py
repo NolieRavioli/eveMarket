@@ -22,14 +22,12 @@ from urllib.parse import parse_qs, urlsplit
 from .esi import EsiClient
 from .index import filter_snapshot, iter_snapshot, matches
 from .inferred import diff_snapshots, load_inferred
-from .jumps import JumpGraph
 from .location import LocationResolver
 from .precompute import (
     history_file as precomputed_history_file,
     history_station_file as precomputed_history_station_file,
     precomputed_dir,
     read_meta as read_precomputed_meta,
-    stats_attr_file as precomputed_stats_attr_file,
     stats_file as precomputed_stats_file,
 )
 from .snapshot import (
@@ -42,11 +40,9 @@ from .snapshot import (
 from .stats import (
     compute_history_stats,
     compute_live_stats,
-    compute_live_stats_with_attribution,
     latest_snapshot_path,
     parse_range,
 )
-from .attribution import estimated_inferred_for_station
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +59,6 @@ class MarketState:
         self.data_dir = Path(data_dir)
         self.client = client or EsiClient()
         self.resolver = LocationResolver(self.sde_dir)
-        self.jumps = JumpGraph(self.sde_dir)
 
 
 def _make_handler(state: MarketState):
@@ -121,9 +116,9 @@ def _make_handler(state: MarketState):
                     "/currentOrders/{location_id}",
                     "/orders                       (entire latest snapshot)",
                     "/orders/{unix_time}[?location=<id>]",
-                    "/inferred/{location_id}[?attribution=jump_weighted]",
+                    "/inferred/{location_id}",
                     "/history/{range}              (NDJSON: every precomputed region+station for this range)",
-                    "POST /stats/{location_id}[?attribution=jump_weighted]  body: [type_id, ...]",
+                    "POST /stats/{location_id}     body: [type_id, ...]",
                     "POST /history/{location_id}/{range}  body: [type_id, ...]",
                 ]})
 
@@ -187,14 +182,6 @@ def _make_handler(state: MarketState):
                 info = state.resolver.classify(lid)
                 if info.kind == "unknown":
                     return self._send_json(404, {"error": "unknown location"})
-                attribution = (qs.get("attribution", [None])[0] or "").lower() or None
-                if attribution and attribution != "jump_weighted":
-                    return self._send_json(400, {"error": "unknown attribution mode",
-                                                  "hint": "use attribution=jump_weighted"})
-                if attribution == "jump_weighted" and info.kind != "station":
-                    return self._send_json(400, {
-                        "error": "attribution=jump_weighted requires a station scope",
-                    })
 
                 # Build the base inferred-trade source (cached file or live diff).
                 cached = load_inferred(state.data_dir, latest)
@@ -210,19 +197,6 @@ def _make_handler(state: MarketState):
                         data_dir=state.data_dir,
                         client=state.client,
                     )
-
-                if attribution == "jump_weighted":
-                    rows = estimated_inferred_for_station(
-                        source_iter,
-                        target_station_id=lid,
-                        resolver=state.resolver,
-                        jumps=state.jumps,
-                        liquidity_index=None,
-                    )
-                    return self._send_ndjson(rows, extra_headers={
-                        "X-Attribution": "jump_weighted",
-                        "X-Snapshot-Unix": latest,
-                    })
 
                 rows = (t for t in source_iter if _trade_matches(t, info, state.resolver))
                 return self._send_ndjson(rows, extra_headers={"X-Snapshot-Unix": latest})
@@ -311,18 +285,6 @@ def _make_handler(state: MarketState):
                 info = state.resolver.classify(lid)
                 if info.kind == "unknown":
                     return self._send_json(404, {"error": "unknown location"})
-                attribution = (urlsplit(self.path).query and
-                               parse_qs(urlsplit(self.path).query).get(
-                                   "attribution", [None])[0]) or None
-                if attribution:
-                    attribution = attribution.lower()
-                if attribution and attribution != "jump_weighted":
-                    return self._send_json(400, {"error": "unknown attribution mode",
-                                                  "hint": "use attribution=jump_weighted"})
-                if attribution == "jump_weighted" and info.kind != "station":
-                    return self._send_json(400, {
-                        "error": "attribution=jump_weighted requires a station scope",
-                    })
                 body = self._read_body()
                 if body is None:
                     return
@@ -335,10 +297,7 @@ def _make_handler(state: MarketState):
                 # fall back to live compute.
                 precomputed_path = None
                 empty_template = _empty_strict_record
-                if attribution == "jump_weighted" and info.kind == "station":
-                    precomputed_path = precomputed_stats_attr_file(state.data_dir, lid)
-                    empty_template = _empty_attr_record
-                elif info.kind in ("region", "station"):
+                if info.kind in ("region", "station"):
                     precomputed_path = precomputed_stats_file(state.data_dir, lid)
 
                 file_payload = _load_precomputed_json(precomputed_path) if precomputed_path else None
@@ -354,13 +313,7 @@ def _make_handler(state: MarketState):
                 snap_path = latest_snapshot_path(state.data_dir)
                 if snap_path is None:
                     return self._send_json(503, {"error": "no snapshots yet"})
-                if attribution == "jump_weighted":
-                    payload = compute_live_stats_with_attribution(
-                        snap_path, lid, type_ids,
-                        resolver=state.resolver, jumps=state.jumps,
-                    )
-                else:
-                    payload = compute_live_stats(snap_path, info, type_ids)
+                payload = compute_live_stats(snap_path, info, type_ids)
                 return self._send_json(200, payload)
 
             if head == "history" and len(parts) == 3:
@@ -437,15 +390,6 @@ _EMPTY_SIDE_STRICT = {
 
 def _empty_strict_record() -> dict:
     return {"buy": dict(_EMPTY_SIDE_STRICT), "sell": dict(_EMPTY_SIDE_STRICT)}
-
-
-def _empty_attr_record() -> dict:
-    buy = dict(_EMPTY_SIDE_STRICT)
-    buy["exact_volume"] = "0.0"
-    buy["estimated_volume"] = "0.0"
-    buy["estimated_order_count"] = "0"
-    return {"buy": buy, "sell": dict(_EMPTY_SIDE_STRICT),
-            "attribution": "jump_weighted"}
 
 
 def _empty_history_record(range_seconds: int) -> dict:
