@@ -5,19 +5,27 @@ set -euo pipefail
 
 SERVICE_NAME="evemarket"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+VENV_DIR=".venv"
 
 # ── resolve paths ─────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON="$(command -v python3)"
-if [[ -z "$PYTHON" ]]; then
+SYSTEM_PYTHON="$(command -v python3)"
+if [[ -z "$SYSTEM_PYTHON" ]]; then
     echo "ERROR: python3 not found in PATH" >&2
     exit 1
 fi
 
-# Prefer the venv inside the project if it exists.
-if [[ -x "$SCRIPT_DIR/.venv/bin/python3" ]]; then
-    PYTHON="$SCRIPT_DIR/.venv/bin/python3"
+# Create (or reuse) a local virtualenv so dependency install does not touch
+# distro-managed Python (PEP 668 on Debian/Ubuntu).
+if [[ ! -x "$SCRIPT_DIR/${VENV_DIR}/bin/python3" ]]; then
+    echo "Creating virtual environment at ${SCRIPT_DIR}/${VENV_DIR}..."
+    if ! "$SYSTEM_PYTHON" -m venv "$SCRIPT_DIR/${VENV_DIR}"; then
+        echo "ERROR: failed to create virtualenv." >&2
+        echo "Hint: install the venv package first (e.g. sudo apt install python3-venv)." >&2
+        exit 1
+    fi
 fi
+PYTHON="$SCRIPT_DIR/${VENV_DIR}/bin/python3"
 
 # Install Python dependencies.
 echo "Installing Python dependencies..."
