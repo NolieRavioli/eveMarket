@@ -11,8 +11,9 @@ import json
 import logging
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 from .collector import collect_snapshot
 from .compression import sweep_old_data
@@ -24,6 +25,37 @@ from .precompute import needs_precompute, run_precompute
 from .snapshot import latest_snapshot, previous_snapshot, orders_path
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Downtime support helpers
+# ---------------------------------------------------------------------------
+
+# EVE server downtime starts at 11:00 UTC every day.
+_DOWNTIME_HOUR_UTC = 11
+
+# ESI health endpoint used to detect recovery.
+_ESI_PING_URL = "https://esi.evetech.net/ping"
+
+# Interval between ESI ping attempts during downtime (seconds).
+_DOWNTIME_POLL_INTERVAL = 120
+
+
+class _CancelToken:
+    """Pseudo-Event whose ``is_set()`` returns True if *any* backing event is set.
+
+    Passed to ``collect_snapshot`` / ``collect_contracts`` as the ``stop_event``
+    argument so that a downtime cancel pulse (``_cancel``) or a full shutdown
+    (``stop_event``) both abort in-flight collection without conflating the two
+    signals.
+    """
+
+    __slots__ = ("_events",)
+
+    def __init__(self, *events: threading.Event) -> None:
+        self._events = events
+
+    def is_set(self) -> bool:  # noqa: D102
+        return any(e.is_set() for e in self._events)
 
 
 class CollectorScheduler:
@@ -46,6 +78,11 @@ class CollectorScheduler:
         self.stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._running = threading.Lock()
+        # Downtime support: _downtime is SET while ESI is suspended; _cancel
+        # is a momentary pulse used by DowntimeGuard to abort an in-flight
+        # collection without triggering a full scheduler shutdown.
+        self._downtime = threading.Event()
+        self._cancel = threading.Event()
         # Precompute artefacts share the resolver with the HTTP server when
         # possible (set via `attach_precompute_resources`); otherwise it is
         # lazy-loaded on first use.
@@ -157,6 +194,17 @@ class CollectorScheduler:
         else:
             next_at = now
         while not self.stop_event.is_set():
+            # --- downtime suspension ---
+            if self._downtime.is_set():
+                logger.info("scheduler: downtime active — waiting for ESI recovery")
+                while self._downtime.is_set() and not self.stop_event.is_set():
+                    self.stop_event.wait(5.0)
+                if self.stop_event.is_set():
+                    return
+                logger.info("scheduler: ESI back — collecting immediately")
+                next_at = time.time()
+                continue
+            # --- normal tick ---
             now = time.time()
             if now >= next_at:
                 collected_at = self._run_one()
@@ -191,7 +239,7 @@ class CollectorScheduler:
                     self.sde_dir, self.data_dir,
                     trigger_unix=trigger_unix,
                     client=self.client,
-                    stop_event=self.stop_event,
+                    stop_event=_CancelToken(self.stop_event, self._cancel),
                 )
             except InterruptedError:
                 logger.info("scheduler: collection interrupted")
@@ -292,6 +340,9 @@ class ContractScheduler:
         self.stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._running = threading.Lock()
+        # Downtime support (see DowntimeGuard).
+        self._downtime = threading.Event()
+        self._cancel = threading.Event()
 
     # --- next-run persistence (so restarts don't double-pull) -----------
 
@@ -351,6 +402,17 @@ class ContractScheduler:
         else:
             next_at = now
         while not self.stop_event.is_set():
+            # --- downtime suspension ---
+            if self._downtime.is_set():
+                logger.info("contracts scheduler: downtime active — waiting for ESI recovery")
+                while self._downtime.is_set() and not self.stop_event.is_set():
+                    self.stop_event.wait(5.0)
+                if self.stop_event.is_set():
+                    return
+                logger.info("contracts scheduler: ESI back — collecting immediately")
+                next_at = time.time()
+                continue
+            # --- normal tick ---
             now = time.time()
             if now >= next_at:
                 esi_lm = self._run_one()
@@ -370,7 +432,7 @@ class ContractScheduler:
                     self.sde_dir, self.data_dir,
                     trigger_unix=int(time.time()),
                     client=self.client,
-                    stop_event=self.stop_event,
+                    stop_event=_CancelToken(self.stop_event, self._cancel),
                 )
             except InterruptedError:
                 logger.info("contracts scheduler: collection interrupted")
@@ -384,4 +446,149 @@ class ContractScheduler:
             return esi_lm_unix
         finally:
             self._running.release()
+
+
+# ---------------------------------------------------------------------------
+# DowntimeGuard
+# ---------------------------------------------------------------------------
+
+class DowntimeGuard:
+    """Suspends all ESI collection around EVE server downtime at 11:00 UTC.
+
+    Behaviour
+    ---------
+    **At 11:00 UTC every day:**
+
+    1. Sends a cancel pulse to any in-flight collection (via ``_cancel``).
+    2. Marks all registered schedulers as suspended (they pause their loops).
+    3. Polls ``GET /ping`` on ESI every 2 minutes until a ``200`` is returned.
+    4. Clears the suspended flag on all schedulers and triggers an immediate
+       collection cycle on each.
+
+    **On startup**, if ESI is not reachable the guard pre-suspends all
+    schedulers before they make any requests, then enters recovery mode
+    immediately.  This covers the case where the server is started while
+    EVE downtime is still in progress.
+    """
+
+    def __init__(
+        self,
+        client: EsiClient,
+        schedulers: "List[CollectorScheduler | ContractScheduler]",
+    ) -> None:
+        self._client = client
+        self._schedulers = list(schedulers)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # --- public lifecycle -----------------------------------------------
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        # Startup probe: if ESI is already unreachable, pre-suspend all
+        # schedulers *before* they issue their first request.
+        if not self._ping():
+            logger.info(
+                "downtime_guard: ESI unreachable on startup — pre-suspending collectors"
+            )
+            for s in self._schedulers:
+                s._downtime.set()
+        self._thread = threading.Thread(
+            target=self._guard_loop,
+            name="eveMarket-downtime-guard",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # --- internal -------------------------------------------------------
+
+    def _ping(self) -> bool:
+        """Return True if the ESI ping endpoint responds with HTTP 200."""
+        try:
+            resp = self._client.session.get(_ESI_PING_URL, timeout=10.0)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def _suspend_all(self) -> None:
+        """Cancel in-flight collections and mark all schedulers as suspended."""
+        logger.info("downtime_guard: suspending all collectors")
+        # Pulse _cancel so that any ongoing collect_snapshot / collect_contracts
+        # call raises InterruptedError at the next region boundary.
+        for s in self._schedulers:
+            s._cancel.set()
+        # Give the cancel signal a moment to propagate through the collection
+        # loops (they check every region, so worst case one region's fetch).
+        self._stop.wait(2.0)
+        for s in self._schedulers:
+            s._downtime.set()
+            s._cancel.clear()  # reset for the next collection cycle
+
+    def _resume_all(self) -> None:
+        """Clear the suspended flag and trigger an immediate collection tick."""
+        logger.info("downtime_guard: ESI is back — resuming all collectors")
+        for s in self._schedulers:
+            s._downtime.clear()
+        # Fire an immediate collection on each scheduler in a daemon thread so
+        # we don't block the guard loop (trigger_now acquires _running lock).
+        for s in self._schedulers:
+            threading.Thread(
+                target=s.trigger_now,
+                name="eveMarket-downtime-resume",
+                daemon=True,
+            ).start()
+
+    def _next_downtime_unix(self) -> float:
+        """Return the unix timestamp of the next 11:00 UTC."""
+        now = datetime.now(timezone.utc)
+        candidate = now.replace(
+            hour=_DOWNTIME_HOUR_UTC, minute=0, second=0, microsecond=0
+        )
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate.timestamp()
+
+    def _do_recovery(self) -> None:
+        """Poll ESI every ``_DOWNTIME_POLL_INTERVAL`` seconds until it returns 200."""
+        while not self._stop.is_set():
+            logger.info("downtime_guard: pinging %s", _ESI_PING_URL)
+            if self._ping():
+                self._resume_all()
+                return
+            logger.info(
+                "downtime_guard: ESI still down — retrying in %ds",
+                _DOWNTIME_POLL_INTERVAL,
+            )
+            self._stop.wait(float(_DOWNTIME_POLL_INTERVAL))
+
+    def _guard_loop(self) -> None:
+        """Main background thread: watch for 11:00 UTC and manage recovery."""
+        # If schedulers were pre-suspended on startup, go straight to recovery.
+        if any(s._downtime.is_set() for s in self._schedulers):
+            self._do_recovery()
+
+        while not self._stop.is_set():
+            next_dt = self._next_downtime_unix()
+            wait_s = next_dt - time.time()
+            h, rem = divmod(int(max(0, wait_s)), 3600)
+            m, s_ = divmod(rem, 60)
+            logger.info(
+                "downtime_guard: next downtime at 11:00 UTC in %dh %02dm %02ds",
+                h, m, s_,
+            )
+            # Sleep until 11:00 UTC, waking every 30 s to check stop.
+            while not self._stop.is_set():
+                remaining = next_dt - time.time()
+                if remaining <= 0:
+                    break
+                self._stop.wait(min(30.0, remaining))
+            if self._stop.is_set():
+                return
+            logger.info("downtime_guard: 11:00 UTC reached — suspending collectors")
+            self._suspend_all()
+            self._do_recovery()
 

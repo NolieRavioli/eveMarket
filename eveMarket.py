@@ -22,7 +22,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from eveMarket import EsiClient, CollectorScheduler, ContractScheduler, serve  # noqa: E402
+from eveMarket import EsiClient, CollectorScheduler, ContractScheduler, DowntimeGuard, serve  # noqa: E402
 from eveMarket.sde_download import download_sde  # noqa: E402
 
 DEFAULT_SDE = HERE / "sde"
@@ -70,9 +70,6 @@ def main() -> int:
         client=client,
         run_inference=not args.no_inference,
     )
-    scheduler.start()
-    log.info("scheduler started (interval=%ss, inference=%s)",
-             args.interval, not args.no_inference)
 
     contract_scheduler: ContractScheduler | None = None
     if not args.no_contracts:
@@ -82,6 +79,22 @@ def main() -> int:
             interval_s=args.contracts_interval,
             client=client,
         )
+
+    # DowntimeGuard: started BEFORE the schedulers so that if ESI is already
+    # unreachable (server launched during EVE downtime) the guard can
+    # pre-suspend the schedulers before they attempt any ESI requests.
+    downtime_guard = DowntimeGuard(
+        client,
+        [scheduler] + ([contract_scheduler] if contract_scheduler is not None else []),
+    )
+    downtime_guard.start()
+    log.info("downtime_guard started (downtime at 11:00 UTC, poll every 2 min)")
+
+    scheduler.start()
+    log.info("scheduler started (interval=%ss, inference=%s)",
+             args.interval, not args.no_inference)
+
+    if contract_scheduler is not None:
         contract_scheduler.start()
         log.info("contracts scheduler started (interval=%ss)",
                  args.contracts_interval)
@@ -110,6 +123,7 @@ def main() -> int:
             scheduler.stop()
             if contract_scheduler is not None:
                 contract_scheduler.stop()
+            downtime_guard.stop()
             httpd.shutdown()
         threading.Thread(target=_do, name="eveMarket-shutdown", daemon=True).start()
 
@@ -125,6 +139,7 @@ def main() -> int:
         scheduler.stop()
         if contract_scheduler is not None:
             contract_scheduler.stop()
+        downtime_guard.stop()
         httpd.server_close()
         log.info("eveMarket stopped")
     return 0
