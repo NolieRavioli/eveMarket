@@ -35,8 +35,11 @@ Optional flags:
 | JSON | `application/json` | All single-object responses |
 | NDJSON | `application/x-ndjson` | Streaming order/trade/history/contract endpoints |
 
-NDJSON: one JSON object per line, chunked transfer encoding. Read line-by-line
-without buffering the full response.
+NDJSON: one JSON object per line. **All NDJSON endpoints are gzip-encoded
+unconditionally** (`Content-Encoding: gzip`, ~12&times; smaller on the wire).
+Standard clients (`requests`, `curl --compressed`, browsers, `wget`) decode
+transparently. Bare `curl` callers should pipe through `gunzip`. Body is
+close-delimited (no chunked encoding); read the stream until EOF.
 
 ## Location IDs
 
