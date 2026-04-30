@@ -99,12 +99,20 @@ class EsiClient:
             )
             time.sleep(sleep_s)
 
-    def get(self, url: str, params: Optional[dict] = None) -> requests.Response:
+    def get(
+        self,
+        url: str,
+        params: Optional[dict] = None,
+        *,
+        headers: Optional[dict] = None,
+    ) -> requests.Response:
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
             self._proactive_sleep()
             try:
-                resp = self.session.get(url, params=params, timeout=self.timeout)
+                resp = self.session.get(
+                    url, params=params, headers=headers, timeout=self.timeout
+                )
             except requests.RequestException as exc:
                 last_exc = exc
                 wait = min(2 ** attempt, 30)

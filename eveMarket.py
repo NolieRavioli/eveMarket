@@ -22,7 +22,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from eveMarket import EsiClient, CollectorScheduler, serve  # noqa: E402
+from eveMarket import EsiClient, CollectorScheduler, ContractScheduler, serve  # noqa: E402
 from eveMarket.sde_download import download_sde  # noqa: E402
 
 DEFAULT_SDE = HERE / "sde"
@@ -39,8 +39,12 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=13307, help="HTTP port")
     ap.add_argument("--interval", type=int, default=1200,
                     help="Collection interval in seconds (default 1200 = 20 min)")
+    ap.add_argument("--contracts-interval", type=int, default=1800,
+                    help="Contracts collection interval in seconds (default 1800 = 30 min)")
     ap.add_argument("--no-inference", action="store_true",
                     help="Disable inferred-trade computation in the scheduler")
+    ap.add_argument("--no-contracts", action="store_true",
+                    help="Disable the public-contracts scheduler")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
 
@@ -68,6 +72,18 @@ def main() -> int:
     log.info("scheduler started (interval=%ss, inference=%s)",
              args.interval, not args.no_inference)
 
+    contract_scheduler: ContractScheduler | None = None
+    if not args.no_contracts:
+        contract_scheduler = ContractScheduler(
+            sde_dir=args.sde,
+            data_dir=args.data,
+            interval_s=args.contracts_interval,
+            client=client,
+        )
+        contract_scheduler.start()
+        log.info("contracts scheduler started (interval=%ss)",
+                 args.contracts_interval)
+
     httpd = serve(
         sde_dir=args.sde,
         data_dir=args.data,
@@ -90,6 +106,8 @@ def main() -> int:
         # from a helper thread to avoid the deadlock.
         def _do():
             scheduler.stop()
+            if contract_scheduler is not None:
+                contract_scheduler.stop()
             httpd.shutdown()
         threading.Thread(target=_do, name="eveMarket-shutdown", daemon=True).start()
 
@@ -103,6 +121,8 @@ def main() -> int:
         httpd.serve_forever()
     finally:
         scheduler.stop()
+        if contract_scheduler is not None:
+            contract_scheduler.stop()
         httpd.server_close()
         log.info("eveMarket stopped")
     return 0

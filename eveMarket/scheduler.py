@@ -5,6 +5,7 @@ still running (no overlapping snapshots).
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -200,20 +201,6 @@ class CollectorScheduler:
 
             # Precompute /stats + /history for the new snapshot.
             self._do_precompute(t_unix)
-            # Refresh the public-contracts snapshot. Run after the market
-            # collection so it doesn't compete for ESI rate limits during
-            # the more time-sensitive orders pull.
-            try:
-                collect_contracts(
-                    self.sde_dir, self.data_dir,
-                    trigger_unix=t_unix,
-                    client=self.client,
-                    stop_event=self.stop_event,
-                )
-            except InterruptedError:
-                logger.info("scheduler: contracts interrupted")
-            except Exception:
-                logger.exception("scheduler: contracts collection failed")
         finally:
             self._running.release()
 
@@ -234,3 +221,125 @@ class CollectorScheduler:
             sweep_old_data(self.data_dir)
         except Exception:
             logger.exception("startup compression sweep failed")
+
+
+# --- contracts -----------------------------------------------------------
+
+# ESI's public-contracts cache window is ~10 minutes; 30 minutes is well
+# above that and keeps load on the upstream low while still presenting a
+# fresh-enough view to clients.
+CONTRACTS_INTERVAL_DEFAULT_S = 1800
+
+
+class ContractScheduler:
+    """Independent 30-minute scheduler for public-contracts collection.
+
+    Runs separately from :class:`CollectorScheduler` so the slower contracts
+    pull never blocks the time-sensitive market snapshot. Persistence of the
+    last successful run lives in the per-region meta file maintained by
+    :func:`collect_contracts` -- the scheduler just records its own next-run
+    time on disk so restarts don't re-pull immediately.
+    """
+
+    NEXT_RUN_FILENAME = "contracts_next_run.json"
+
+    def __init__(
+        self,
+        sde_dir: Path,
+        data_dir: Path,
+        *,
+        interval_s: int = CONTRACTS_INTERVAL_DEFAULT_S,
+        client: Optional[EsiClient] = None,
+    ) -> None:
+        self.sde_dir = Path(sde_dir)
+        self.data_dir = Path(data_dir)
+        self.interval_s = int(interval_s)
+        self.client = client or EsiClient()
+        self.stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._running = threading.Lock()
+
+    # --- next-run persistence (so restarts don't double-pull) -----------
+
+    def _next_run_path(self) -> Path:
+        from .snapshot import contracts_dir as _cdir
+        return _cdir(self.data_dir) / self.NEXT_RUN_FILENAME
+
+    def _load_next_run(self) -> Optional[float]:
+        path = self._next_run_path()
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return float(data.get("next_run_unix") or 0) or None
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _save_next_run(self, next_run_unix: float) -> None:
+        path = self._next_run_path()
+        tmp = path.with_suffix(".json.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump({"next_run_unix": float(next_run_unix)}, f)
+            import os as _os
+            _os.replace(tmp, path)
+        except OSError:
+            logger.warning("could not persist contracts next-run marker")
+
+    # --- lifecycle ------------------------------------------------------
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="eveMarket-contracts-scheduler", daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def trigger_now(self) -> None:
+        self._run_one()
+
+    def _loop(self) -> None:
+        now = time.time()
+        persisted_next = self._load_next_run()
+        if persisted_next is not None and persisted_next > now:
+            next_at = persisted_next
+            wait_s = next_at - now
+            mins, secs = divmod(int(wait_s), 60)
+            logger.info(
+                "contracts scheduler: next run in %dm %02ds (persisted)",
+                mins, secs,
+            )
+        else:
+            next_at = now
+        while not self.stop_event.is_set():
+            now = time.time()
+            if now >= next_at:
+                self._run_one()
+                next_at = time.time() + self.interval_s
+                self._save_next_run(next_at)
+            self.stop_event.wait(min(15.0, max(0.5, next_at - time.time())))
+
+    def _run_one(self) -> None:
+        if not self._running.acquire(blocking=False):
+            logger.warning("contracts scheduler: previous run still in flight, skipping tick")
+            return
+        try:
+            try:
+                collect_contracts(
+                    self.sde_dir, self.data_dir,
+                    trigger_unix=int(time.time()),
+                    client=self.client,
+                    stop_event=self.stop_event,
+                )
+            except InterruptedError:
+                logger.info("contracts scheduler: collection interrupted")
+            except Exception:
+                logger.exception("contracts scheduler: collection failed")
+        finally:
+            self._running.release()
+
