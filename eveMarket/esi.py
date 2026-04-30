@@ -6,6 +6,7 @@ dependency on the eveHauler package.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Optional
 
@@ -64,38 +65,47 @@ class EsiClient:
             "User-Agent": user_agent,
             "Accept": "application/json",
         })
+        # Rate-limit state updated from ESI response headers. Protected by
+        # _rl_lock because CollectorScheduler and ContractScheduler share a
+        # single EsiClient and call get() from different threads.
+        self._rl_lock = threading.Lock()
         self.rl_remaining: Optional[int] = None
         self.rl_limit: Optional[int] = None
         self.rl_window_seconds: Optional[int] = None
         self.rl_group: Optional[str] = None
 
     def update_from_headers(self, headers) -> None:
-        try:
-            rem = headers.get("X-Ratelimit-Remaining")
-            if rem is not None:
-                self.rl_remaining = int(rem)
-        except (TypeError, ValueError):
-            pass
-        lim, window = _parse_limit_header(headers.get("X-Ratelimit-Limit"))
-        if lim is not None:
-            self.rl_limit = lim
-        if window is not None:
-            self.rl_window_seconds = window
-        grp = headers.get("X-Ratelimit-Group")
-        if grp:
-            self.rl_group = grp
+        with self._rl_lock:
+            try:
+                rem = headers.get("X-Ratelimit-Remaining")
+                if rem is not None:
+                    self.rl_remaining = int(rem)
+            except (TypeError, ValueError):
+                pass
+            lim, window = _parse_limit_header(headers.get("X-Ratelimit-Limit"))
+            if lim is not None:
+                self.rl_limit = lim
+            if window is not None:
+                self.rl_window_seconds = window
+            grp = headers.get("X-Ratelimit-Group")
+            if grp:
+                self.rl_group = grp
 
     def _proactive_sleep(self) -> None:
+        with self._rl_lock:
+            rem = self.rl_remaining
+            lim = self.rl_limit
+            win = self.rl_window_seconds
         if (
-            self.rl_remaining is not None
-            and self.rl_limit
-            and self.rl_window_seconds
-            and self.rl_remaining <= self.low_water
+            rem is not None
+            and lim
+            and win
+            and rem <= self.low_water
         ):
-            sleep_s = self.rl_window_seconds / max(self.rl_limit, 1)
+            sleep_s = win / max(lim, 1)
             logger.info(
                 "[ESI] floating window low (%s/%s) - sleeping %.2fs",
-                self.rl_remaining, self.rl_limit, sleep_s,
+                rem, lim, sleep_s,
             )
             time.sleep(sleep_s)
 

@@ -22,7 +22,10 @@ from pathlib import Path
 from typing import IO, Iterable, Optional
 
 from .snapshot import (
+    contracts_dir,
+    contracts_path,
     inferred_dir,
+    list_contracts_snapshots,
     list_snapshots,
     orders_dir,
     orders_path,
@@ -124,8 +127,9 @@ def sweep_old_data(
     *,
     keep_orders: int = 2,
     keep_inferred: int = 1,
+    keep_contracts: int = 1,
 ) -> dict[str, int]:
-    """Gzip historical order/inferred files, leaving the newest few alone.
+    """Gzip historical order/inferred/contracts files, leaving the newest few alone.
 
     Returns a small report dict with counts and bytes saved. Safe to call
     repeatedly; already-compressed files are skipped.
@@ -133,6 +137,7 @@ def sweep_old_data(
     report = {
         "orders_compressed": 0,
         "inferred_compressed": 0,
+        "contracts_compressed": 0,
         "bytes_before": 0,
         "bytes_after": 0,
         "elapsed_s": 0,
@@ -189,13 +194,39 @@ def sweep_old_data(
             except Exception:
                 logger.exception("failed to gzip %s", src)
 
+    # --- contracts snapshots ----------------------------------------
+    contract_unix = list_contracts_snapshots(data_dir)
+    if len(contract_unix) > keep_contracts:
+        old = contract_unix[: len(contract_unix) - keep_contracts]
+        for unix in old:
+            src = contracts_path(data_dir, unix)
+            if not src.exists():
+                continue  # already gzipped
+            try:
+                size_before = src.stat().st_size
+                dst = _gzip_in_place(src)
+                size_after = dst.stat().st_size
+                report["contracts_compressed"] += 1
+                report["bytes_before"] += size_before
+                report["bytes_after"] += size_after
+                logger.info(
+                    "compressed contracts-%s.jsonl: %.1f MiB -> %.1f MiB (%.1fx)",
+                    unix,
+                    size_before / 1024 / 1024,
+                    size_after / 1024 / 1024,
+                    size_before / max(size_after, 1),
+                )
+            except Exception:
+                logger.exception("failed to gzip %s", src)
+
     report["elapsed_s"] = round(time.monotonic() - t0, 2)
-    if report["orders_compressed"] or report["inferred_compressed"]:
+    if report["orders_compressed"] or report["inferred_compressed"] or report["contracts_compressed"]:
         saved = report["bytes_before"] - report["bytes_after"]
         logger.info(
-            "sweep: compressed %s orders + %s inferred in %ss, saved %.1f MiB",
+            "sweep: compressed %s orders + %s inferred + %s contracts in %ss, saved %.1f MiB",
             report["orders_compressed"],
             report["inferred_compressed"],
+            report["contracts_compressed"],
             report["elapsed_s"],
             saved / 1024 / 1024,
         )

@@ -342,6 +342,11 @@ class ContractScheduler:
                 logger.info("contracts scheduler: collection interrupted")
             except Exception:
                 logger.exception("contracts scheduler: collection failed")
+            # Compress old contract snapshots so they don't accumulate on disk.
+            try:
+                sweep_old_data(self.data_dir)
+            except Exception:
+                logger.exception("contracts scheduler: compression sweep failed")
         finally:
             self._running.release()
 
