@@ -23,16 +23,17 @@ Optional flags:
 | `--bind` | `0.0.0.0` | HTTP bind address |
 | `--port` | `13307` | HTTP port |
 | `--data` | `./data` | Data directory |
-| `--sde` | `./sde` | SDE directory |
+| `--sde` | `./sde` | SDE directory (auto-downloaded if missing) |
 | `--interval` | `1200` | Collection interval in seconds (20 min) |
 | `--no-inference` | | Disable inferred-trade processing |
+| `--log-level` | `INFO` | Python logging level |
 
 ## Response formats
 
 | Format | Content-Type | When used |
 |--------|-------------|-----------|
 | JSON | `application/json` | All single-object responses |
-| NDJSON | `application/x-ndjson` | Streaming order/trade endpoints |
+| NDJSON | `application/x-ndjson` | Streaming order/trade/history/contract endpoints |
 
 NDJSON: one JSON object per line, chunked transfer encoding. Read line-by-line
 without buffering the full response.
@@ -55,7 +56,7 @@ All `{location_id}` path parameters accept any of:
 
 ### `GET /`
 
-Service discovery. Returns a JSON object listing available routes.
+Service overview. Returns an HTML page documenting all available routes (this README, rendered).
 
 ---
 
@@ -188,14 +189,7 @@ available; falls back to live computation otherwise.
 ```
 GET /inferred/10000002
 GET /inferred/60003760
-GET /inferred/60003760?attribution=jump_weighted
 ```
-
-**Query parameters**
-
-| Param | Values | Description |
-|-------|--------|-------------|
-| `attribution` | `jump_weighted` | Station scope only — see [Jump-weighted attribution](#jump-weighted-attribution) |
 
 **Response** `200 application/x-ndjson` — stream of inferred-trade objects:
 
@@ -219,29 +213,98 @@ GET /inferred/60003760?attribution=jump_weighted
 | `buyer_range` | string\|null | ESI range of the buy order (`"station"`, `"solarsystem"`, `"constellation"`, `"region"`, or jump count as string). `null` for sell-side fills. |
 | `buyer_station_id` | int\|null | Station ID of the buyer's order. `null` for sell-side fills. |
 
-When `?attribution=jump_weighted` is used, estimated trades are also emitted with
-these additional fields:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `estimated` | bool | Always `true` |
-| `attribution` | string | `"jump_weighted"` |
-| `attribution_share` | float | Fraction of the original trade volume attributed here (0–1) |
-
-Response headers:
-
-| Header | Description |
-|--------|-------------|
-| `X-Snapshot-Unix` | Unix timestamp of the snapshot used |
-| `X-Attribution` | `"jump_weighted"` when attribution mode is active |
+Response header `X-Snapshot-Unix` carries the unix timestamp of the snapshot used.
 
 **Errors**
 
 | Code | Reason |
 |------|--------|
-| `400` | Invalid `location_id`; or `attribution=jump_weighted` on a non-station scope; or unknown attribution value |
+| `400` | Invalid `location_id` |
 | `404` | Unknown location |
 | `503` | No snapshots yet, or fewer than 2 snapshots available |
+
+---
+
+### `GET /history/{range}`
+
+Universe-wide precomputed history — one NDJSON row per precomputed region or NPC
+station. Used by eveHauler to bulk-load fill caps without per-station POST requests.
+
+Precomputed ranges: `7d`, `14d`, `30d`.
+
+```
+GET /history/7d
+GET /history/30d
+```
+
+**Response** `200 application/x-ndjson`
+
+```json
+{"scope":"station","location_id":60003760,"range":"30d","types":{"34":{"buy":{...},"sell":{...}},...}}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `scope` | string | `"region"` or `"station"` |
+| `location_id` | int | Region or NPC station ID |
+| `range` | string | Range label matching the request (e.g. `"30d"`) |
+| `types` | object | Map of `type_id` string → `{"buy":{…},"sell":{…}}` — same shape as [`POST /stats`](#post-statslocation_id) response values |
+
+Response headers:
+
+| Header | Description |
+|--------|-------------|
+| `X-History-Range` | Range label used |
+| `X-Snapshot-Unix` | Snapshot unix timestamp from precompute metadata (if available) |
+
+**Errors**
+
+| Code | Reason |
+|------|--------|
+| `400` | Invalid or non-precomputed range |
+
+---
+
+### `GET /contracts/courier`
+
+Every currently-active public courier contract, universe-wide, from the latest
+contracts snapshot.
+
+```
+GET /contracts/courier
+```
+
+**Response** `200 application/x-ndjson`
+
+```json
+{"contract_id":12345678,"region_id":10000002,"start_location_id":60003760,
+ "end_location_id":60008494,"reward":5000000.0,"collateral":500000000.0,
+ "volume":10000.0,"days_to_complete":3,"date_issued":"2026-04-22T14:00:00Z",
+ "date_expired":"2026-04-29T14:00:00Z","title":""}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `contract_id` | int | ESI contract ID |
+| `region_id` | int | Region the contract was collected from |
+| `start_location_id` | int | Pickup station or structure |
+| `end_location_id` | int | Dropoff station or structure |
+| `reward` | float | ISK reward offered |
+| `collateral` | float | ISK collateral required |
+| `volume` | float | Cargo volume in m³ |
+| `days_to_complete` | int | Days to complete after acceptance |
+| `date_issued` | string | ISO 8601 UTC |
+| `date_expired` | string | ISO 8601 UTC — only non-expired contracts are returned |
+| `title` | string | Contract title (may be empty) |
+
+Response header `X-Contracts-Snapshot-Unix` carries the unix timestamp of the
+snapshot used.
+
+**Errors**
+
+| Code | Reason |
+|------|--------|
+| `503` | No contracts snapshot yet |
 
 ---
 
@@ -254,19 +317,12 @@ to live snapshot scan for constellations, systems, and structures.
 ```
 POST /stats/10000002
 POST /stats/60003760
-POST /stats/60003760?attribution=jump_weighted
 Content-Type: application/json
 
 [34, 35, 36]
 ```
 
 **Request body** — JSON array of `type_id` integers (max 1 MiB).
-
-**Query parameters**
-
-| Param | Values | Description |
-|-------|--------|-------------|
-| `attribution` | `jump_weighted` | Station scope only — augments buy side with fractionally-attributed non-station-range buys |
 
 **Response** `200 application/json` — object keyed by stringified `type_id`:
 
@@ -310,36 +366,11 @@ All numeric fields are returned as strings to preserve precision.
 | `orderCount` | Number of orders |
 | `percentile` | 5th percentile for sell side; 95th percentile for buy side (best realistic fill price) |
 
-With `?attribution=jump_weighted` the buy side gains extra fields and a top-level `attribution` key:
-
-```json
-{
-  "34": {
-    "buy": {
-      "...",
-      "exact_volume": "8192983945.0",
-      "estimated_volume": "2319817176.4",
-      "estimated_order_count": "0",
-      "volume": "10512801121.4",
-      "orderCount": "32"
-    },
-    "sell": { "..." },
-    "attribution": "jump_weighted"
-  }
-}
-```
-
-| Extra field | Description |
-|-------------|-------------|
-| `exact_volume` | Volume from station-range buy orders at this station |
-| `estimated_volume` | Fractionally-attributed volume from non-station-range buys |
-| `estimated_order_count` | Count of estimated (fractional) buy orders |
-
 **Errors**
 
 | Code | Reason |
 |------|--------|
-| `400` | Invalid `location_id`; malformed or empty body; `attribution=jump_weighted` on a non-station scope; unknown attribution value |
+| `400` | Invalid `location_id`; malformed or empty body |
 | `404` | Unknown location |
 | `413` | Body exceeds 1 MiB |
 | `503` | No snapshots yet |
@@ -396,7 +427,7 @@ Notes:
 - Region scope aggregates every inferred trade in the region over the window.
 - Station scope aggregates inferred trades whose `location_id` exactly matches
   the station (sells always have a concrete location; buy orders with a wider
-  range have no station attribution and are excluded).
+  range have no concrete station and are excluded).
 - Types with no trades in the window return zeroed records.
 
 **Errors**
@@ -409,53 +440,21 @@ Notes:
 
 ---
 
-## Jump-weighted attribution
-
-Non-station-range buy orders (range = `solarsystem`, `constellation`, `region`,
-or a jump count) fill from multiple potential stations. The exact fill station
-cannot be determined from order snapshots alone. By default such trades carry
-`location_id: null` and are excluded from station-scope queries.
-
-With `?attribution=jump_weighted`, station-scope `/inferred` and `/stats`
-requests synthesize estimated contributions from those unresolved trades using:
-
-```
-weight(s) = (1 / (1 + jumps(buyer_system, system(s)))) × sell_liquidity(type, s)
-share(s)  = weight(s) / Σ weight
-```
-
-The sell-side liquidity term biases shares toward stations that actually hold
-current sell offers for that type. Stations with zero sell liquidity are excluded
-entirely (the remaining candidates absorb their weight).
-
-Estimated `/inferred` trades are emitted alongside exact trades with:
-
-- `estimated: true`
-- `attribution: "jump_weighted"`
-- `attribution_share: <float 0–1>`
-
-Estimated `/stats` buy-side volumes are merged into the standard buy fields
-with `exact_volume`, `estimated_volume`, and `estimated_order_count` breakdowns.
-
-This mode is opt-in. Default behavior is unchanged.
-
----
-
 ## Data layout
 
 Default under `./data`:
 
 | Path | Description |
 |------|-------------|
-| `orders/orders-<unix>.jsonl` | Raw snapshot — one order per line (latest 2 only) |
+| `orders/orders-<unix>.jsonl` | Raw snapshot — one order per line (latest 2 uncompressed) |
 | `orders/orders-<unix>.jsonl.gz` | Older snapshots, gzipped in place (~12× smaller) |
 | `inferred/infer-<unix>.jsonl` | Inferred trades for the latest snapshot pair |
 | `inferred/infer-<unix>.jsonl.gz` | Older inferred-trade files, gzipped in place |
 | `inferred/infer-<unix>.done` | Completion marker |
+| `contracts/contracts-<unix>.jsonl` | Raw public contracts snapshot |
 | `history/region-<id>.json` | Cached ESI per-region daily history |
 | `precomputed/meta.json` | Generation metadata (snapshot_unix, elapsed_s, counts) |
-| `precomputed/stats/<location_id>.json` | Strict order-book stats (regions + NPC stations) |
-| `precomputed/stats_attr/<station_id>.json` | Jump-weighted stats (NPC stations) |
+| `precomputed/stats/<location_id>.json` | Order-book stats (regions + NPC stations) |
 | `precomputed/history/<region_id>_<range>.json` | Per-region inferred-trade stats (ranges: 7d, 14d, 30d) |
 | `precomputed/history_station/<station_id>_<range>.json` | Per-NPC-station inferred-trade stats (ranges: 7d, 14d, 30d) |
 
