@@ -2,7 +2,7 @@
 
 Usage:
     python eveMarket.py [--sde ./sde] [--data ./data]
-                        [--bind 0.0.0.0] [--port 13307] [--interval 1200]
+                        [--bind 0.0.0.0] [--port 13307] [--interval 301]
 
 Starts:
   - 20-minute market-snapshot scheduler (writes data/orders/orders-<unix>.jsonl)
@@ -37,8 +37,10 @@ def main() -> int:
                     help="Path to data directory (default: ./data)")
     ap.add_argument("--bind", default="0.0.0.0", help="HTTP bind address")
     ap.add_argument("--port", type=int, default=13307, help="HTTP port")
-    ap.add_argument("--interval", type=int, default=1200,
-                    help="Collection interval in seconds (default 1200 = 20 min)")
+    ap.add_argument("--interval", type=int, default=301,
+                    help="Collection interval in seconds (default 301 = 5m 1s; "
+                         "one second past ESI's market cache so we always pick "
+                         "up the next refresh)")
     ap.add_argument("--contracts-interval", type=int, default=1800,
                     help="Contracts collection interval in seconds (default 1800 = 30 min)")
     ap.add_argument("--no-inference", action="store_true",

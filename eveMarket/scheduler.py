@@ -1,7 +1,9 @@
-"""20-minute collection scheduler.
+"""5-minute order-book collection scheduler.
 
 Runs forever in a daemon thread. Skips a tick if the previous collection is
-still running (no overlapping snapshots).
+still running (no overlapping snapshots). The default interval (301 s) is
+one second past ESI's 5-minute Last-Modified cache so the very first tick
+after the cache flips picks up the new data immediately.
 """
 from __future__ import annotations
 
@@ -30,7 +32,7 @@ class CollectorScheduler:
         sde_dir: Path,
         data_dir: Path,
         *,
-        interval_s: int = 1200,
+        interval_s: int = 301,
         client: Optional[EsiClient] = None,
         run_inference: bool = True,
         on_snapshot: Optional[Callable[[Path, int, int], None]] = None,
