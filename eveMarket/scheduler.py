@@ -160,21 +160,25 @@ class CollectorScheduler:
             now = time.time()
             if now >= next_at:
                 collected_at = self._run_one()
-                # Schedule the next tick from when the snapshot was actually
-                # written (or now if collection failed), not from when we
-                # started waiting. This means if the collection took 4m 30s
-                # and the interval is 5m 1s, we only wait ~31s before the
-                # next check rather than another full 5m 1s.
+                # Base the next tick on the ESI Last-Modified timestamp
+                # (returned by collect_snapshot) so we fire exactly
+                # interval_s after ESI's cache epoch, not interval_s after
+                # we finished the crawl. Falls back to time.time() if the
+                # collection failed or returned no Last-Modified headers.
                 next_at = (collected_at or time.time()) + self.interval_s
             self.stop_event.wait(min(5.0, max(0.5, next_at - time.time())))
 
     def _run_one(self) -> Optional[float]:
-        """Collect one snapshot; return its unix timestamp, or None on failure.
+        """Collect one snapshot; return the ESI Last-Modified unix time (basis
+        for the next scheduled tick), or None on failure.
+
+        Returns the max Last-Modified across all cached regions so the loop
+        can schedule the next tick as ``esi_last_modified + interval_s``
+        rather than ``time.time() + interval_s``. If ESI returned no
+        Last-Modified headers (all-304 run) falls back to the trigger unix.
 
         Inference and precompute run in a separate daemon thread so the
         collection lock is released as soon as the snapshot file is written.
-        This lets the loop check immediately whether ESI data has already
-        refreshed again (e.g. if collection took longer than the interval).
         """
         if not self._running.acquire(blocking=False):
             logger.warning("scheduler: previous collection still running, skipping tick")
@@ -183,7 +187,7 @@ class CollectorScheduler:
             trigger_unix = int(time.time())
             prev_unix = previous_snapshot(self.data_dir, trigger_unix)
             try:
-                out, total, t_unix = collect_snapshot(
+                out, total, t_unix, esi_lm_unix = collect_snapshot(
                     self.sde_dir, self.data_dir,
                     trigger_unix=trigger_unix,
                     client=self.client,
@@ -214,7 +218,10 @@ class CollectorScheduler:
             daemon=True,
         ).start()
 
-        return float(t_unix)
+        # Return ESI Last-Modified as the basis for the next scheduled tick.
+        # If no region returned a Last-Modified (all-304 run), fall back to
+        # the trigger time so the interval is measured from the same epoch.
+        return float(esi_lm_unix) if esi_lm_unix is not None else float(t_unix)
 
     def _post_collect(self, out: Path, t_unix: int, prev_unix: Optional[int]) -> None:
         """Inference + precompute + compression sweep for a completed snapshot."""
@@ -346,18 +353,20 @@ class ContractScheduler:
         while not self.stop_event.is_set():
             now = time.time()
             if now >= next_at:
-                self._run_one()
-                next_at = time.time() + self.interval_s
+                esi_lm = self._run_one()
+                next_at = (esi_lm or time.time()) + self.interval_s
                 self._save_next_run(next_at)
             self.stop_event.wait(min(15.0, max(0.5, next_at - time.time())))
 
-    def _run_one(self) -> None:
+    def _run_one(self) -> Optional[float]:
+        """Collect contracts; return ESI Last-Modified unix (basis for next tick), or None."""
         if not self._running.acquire(blocking=False):
             logger.warning("contracts scheduler: previous run still in flight, skipping tick")
-            return
+            return None
         try:
+            esi_lm_unix: Optional[float] = None
             try:
-                collect_contracts(
+                _, _, _, esi_lm_unix = collect_contracts(
                     self.sde_dir, self.data_dir,
                     trigger_unix=int(time.time()),
                     client=self.client,
@@ -372,6 +381,7 @@ class ContractScheduler:
                 sweep_old_data(self.data_dir)
             except Exception:
                 logger.exception("contracts scheduler: compression sweep failed")
+            return esi_lm_unix
         finally:
             self._running.release()
 

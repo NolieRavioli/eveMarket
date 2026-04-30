@@ -180,6 +180,30 @@ def _normalize_last_modified(value: Optional[str]) -> Optional[str]:
     return format_datetime(dt.astimezone(timezone.utc), usegmt=True)
 
 
+def _meta_max_lm_unix(meta: dict) -> Optional[float]:
+    """Return the newest Last-Modified unix time across all cached regions.
+
+    Used by the scheduler to derive the next collection time as
+    ``max_lm + interval`` rather than ``time.time() + interval``, so we
+    fire exactly when ESI's cache window expires instead of drifting.
+    """
+    best: Optional[float] = None
+    for info in meta.get("regions", {}).values():
+        lm = info.get("last_modified") or ""
+        if not lm:
+            continue
+        try:
+            dt = parsedate_to_datetime(lm)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ts = dt.timestamp()
+            if best is None or ts > best:
+                best = ts
+        except (TypeError, ValueError):
+            pass
+    return best
+
+
 # --- collection ---------------------------------------------------------
 
 def collect_snapshot(
@@ -189,10 +213,14 @@ def collect_snapshot(
     trigger_unix: Optional[int] = None,
     client: Optional[EsiClient] = None,
     stop_event: Optional[threading.Event] = None,
-) -> tuple[Path, int, int]:
+) -> tuple[Path, int, int, Optional[float]]:
     """Refresh per-region order-book cache and emit an aggregate snapshot.
 
-    Returns ``(out_path, orders_total, trigger_unix)``.
+    Returns ``(out_path, orders_total, trigger_unix, esi_last_modified_unix)``.
+    ``esi_last_modified_unix`` is the newest ``Last-Modified`` unix time seen
+    across all cached regions (``None`` if no region returned that header).
+    The scheduler adds ``interval_s`` to this value to derive the next tick
+    time so collections fire exactly when ESI's cache window expires.
     """
     sde_dir = Path(sde_dir)
     data_dir = Path(data_dir)
@@ -395,4 +423,4 @@ def collect_snapshot(
         refreshed, not_modified, failed, orders_total, out_path,
         time.monotonic() - t0,
     )
-    return out_path, orders_total, trigger_unix
+    return out_path, orders_total, trigger_unix, _meta_max_lm_unix(meta)

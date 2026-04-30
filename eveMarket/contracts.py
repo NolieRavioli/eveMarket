@@ -157,6 +157,29 @@ def _normalize_last_modified(value: Optional[str]) -> Optional[str]:
     return format_datetime(dt.astimezone(timezone.utc), usegmt=True)
 
 
+def _meta_max_lm_unix(meta: dict) -> Optional[float]:
+    """Return the newest Last-Modified unix time across all cached regions.
+
+    Used by the scheduler to derive the next collection time as
+    ``max_lm + interval`` rather than ``time.time() + interval``.
+    """
+    best: Optional[float] = None
+    for info in meta.get("regions", {}).values():
+        lm = info.get("last_modified") or ""
+        if not lm:
+            continue
+        try:
+            dt = parsedate_to_datetime(lm)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ts = dt.timestamp()
+            if best is None or ts > best:
+                best = ts
+        except (TypeError, ValueError):
+            pass
+    return best
+
+
 # --- collection ---------------------------------------------------------
 
 def collect_contracts(
@@ -166,10 +189,12 @@ def collect_contracts(
     trigger_unix: Optional[int] = None,
     client: Optional[EsiClient] = None,
     stop_event: Optional[threading.Event] = None,
-) -> tuple[Path, int, int]:
+) -> tuple[Path, int, int, Optional[float]]:
     """Refresh per-region public-contracts cache and emit an aggregate snapshot.
 
-    Returns ``(snapshot_path, total_rows, trigger_unix)``.
+    Returns ``(snapshot_path, total_rows, trigger_unix, esi_last_modified_unix)``.
+    ``esi_last_modified_unix`` is the newest ``Last-Modified`` unix time seen
+    across all cached regions (``None`` if no region returned that header).
     """
     sde_dir = Path(sde_dir)
     data_dir = Path(data_dir)
@@ -371,7 +396,7 @@ def collect_contracts(
         refreshed, not_modified, failed,
         contracts_total, out_path, time.monotonic() - t0,
     )
-    return out_path, contracts_total, trigger_unix
+    return out_path, contracts_total, trigger_unix, _meta_max_lm_unix(meta)
 
 
 
