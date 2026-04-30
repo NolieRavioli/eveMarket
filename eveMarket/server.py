@@ -20,6 +20,7 @@ from typing import Iterable, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from .esi import EsiClient
+from .contracts import iter_courier_contracts
 from .index import filter_snapshot, iter_snapshot, matches
 from .inferred import diff_snapshots, load_inferred
 from .location import LocationResolver
@@ -31,7 +32,9 @@ from .precompute import (
     stats_file as precomputed_stats_file,
 )
 from .snapshot import (
+    contracts_path,
     find_nearest_snapshot,
+    latest_contracts_snapshot,
     latest_snapshot,
     list_snapshots,
     orders_path,
@@ -118,6 +121,7 @@ def _make_handler(state: MarketState):
                     "/orders/{unix_time}[?location=<id>]",
                     "/inferred/{location_id}",
                     "/history/{range}              (NDJSON: every precomputed region+station for this range)",
+                    "/contracts/courier            (NDJSON: every active public courier contract, universe-wide)",
                     "POST /stats/{location_id}     body: [type_id, ...]",
                     "POST /history/{location_id}/{range}  body: [type_id, ...]",
                 ]})
@@ -225,6 +229,19 @@ def _make_handler(state: MarketState):
                 if snap_unix is not None:
                     extra["X-Snapshot-Unix"] = snap_unix
                 return self._send_ndjson(rows, extra_headers=extra)
+
+            if head == "contracts" and len(parts) == 2 and parts[1] == "courier":
+                snap = latest_contracts_snapshot(state.data_dir)
+                if snap is None:
+                    return self._send_json(503, {"error": "no contracts snapshot yet"})
+                snap_path = contracts_path(state.data_dir, snap)
+                if not snap_path.exists():
+                    return self._send_json(503, {"error": "contracts snapshot missing on disk"})
+                rows = iter_courier_contracts(snap_path)
+                return self._send_ndjson(
+                    rows,
+                    extra_headers={"X-Contracts-Snapshot-Unix": snap},
+                )
 
             return self._send_json(404, {"error": "not found", "path": self.path})
 

@@ -13,6 +13,7 @@ from typing import Callable, Optional
 
 from .collector import collect_snapshot
 from .compression import sweep_old_data
+from .contracts import collect_contracts
 from .esi import EsiClient
 from .inferred import diff_snapshots, is_complete, write_inferred
 from .location import LocationResolver
@@ -199,6 +200,20 @@ class CollectorScheduler:
 
             # Precompute /stats + /history for the new snapshot.
             self._do_precompute(t_unix)
+            # Refresh the public-contracts snapshot. Run after the market
+            # collection so it doesn't compete for ESI rate limits during
+            # the more time-sensitive orders pull.
+            try:
+                collect_contracts(
+                    self.sde_dir, self.data_dir,
+                    trigger_unix=t_unix,
+                    client=self.client,
+                    stop_event=self.stop_event,
+                )
+            except InterruptedError:
+                logger.info("scheduler: contracts interrupted")
+            except Exception:
+                logger.exception("scheduler: contracts collection failed")
         finally:
             self._running.release()
 

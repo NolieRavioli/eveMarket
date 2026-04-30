@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 _ORDERS_RE = re.compile(r"^orders-(\d+)\.jsonl(?:\.gz)?$")
+_CONTRACTS_RE = re.compile(r"^contracts-(\d+)\.jsonl(?:\.gz)?$")
 
 
 def orders_dir(data_dir: Path) -> Path:
@@ -32,8 +33,18 @@ def history_dir(data_dir: Path) -> Path:
     return p
 
 
+def contracts_dir(data_dir: Path) -> Path:
+    p = Path(data_dir) / "contracts"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def orders_path(data_dir: Path, unix_time: int) -> Path:
     return orders_dir(data_dir) / f"orders-{int(unix_time)}.jsonl"
+
+
+def contracts_path(data_dir: Path, unix_time: int) -> Path:
+    return contracts_dir(data_dir) / f"contracts-{int(unix_time)}.jsonl"
 
 
 def list_snapshots(data_dir: Path) -> list[int]:
@@ -55,6 +66,28 @@ def list_snapshots(data_dir: Path) -> list[int]:
 
 def latest_snapshot(data_dir: Path) -> Optional[int]:
     snaps = list_snapshots(data_dir)
+    return snaps[-1] if snaps else None
+
+
+def list_contracts_snapshots(data_dir: Path) -> list[int]:
+    """Return sorted list of contracts-snapshot unix-times present on disk."""
+    out: list[int] = []
+    d = contracts_dir(data_dir)
+    for entry in d.iterdir():
+        if not entry.is_file():
+            continue
+        m = _CONTRACTS_RE.match(entry.name)
+        if m:
+            try:
+                out.append(int(m.group(1)))
+            except ValueError:
+                pass
+    out.sort()
+    return out
+
+
+def latest_contracts_snapshot(data_dir: Path) -> Optional[int]:
+    snaps = list_contracts_snapshots(data_dir)
     return snaps[-1] if snaps else None
 
 
