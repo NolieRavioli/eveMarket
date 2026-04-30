@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 ESI_BASE = "https://esi.evetech.net/latest"
 DEFAULT_REFRESH_S = 12 * 3600
 
+# After a 404 from ESI (common right after daily restart while ESI rebuilds
+# its history cache), back off for this many seconds before retrying rather
+# than hammering the same endpoint on every inference pass.
+_NOT_FOUND_BACKOFF_S = 1800  # 30 minutes
+
 
 def _history_path(data_dir: Path, region_id: int) -> Path:
     return history_dir(data_dir) / f"region-{int(region_id)}.json"
@@ -65,6 +70,10 @@ class HistoryStore:
         # can skip the disk write for read-only regions.
         self._dirty: set[int] = set()
         self._fetch_count = 0  # for status-line accounting
+        # Consecutive live-404 counter. Incremented each time a real network
+        # request returns 404; reset to 0 on any successful 200. Used by
+        # callers to detect the post-restart ESI spam burst.
+        self._consecutive_404s: int = 0
 
     def _ensure_loaded(self, region_id: int) -> dict:
         """Load region cache from disk on first touch; return the dict."""
@@ -101,8 +110,10 @@ class HistoryStore:
 
         with self._lock:
             entry = types_map.get(key)
-            if entry and (time.time() - float(entry.get("fetched_at", 0))) < self.refresh_after_s:
-                return list(entry.get("rows", []))
+            if entry:
+                ttl = _NOT_FOUND_BACKOFF_S if entry.get("not_found") else self.refresh_after_s
+                if (time.time() - float(entry.get("fetched_at", 0))) < ttl:
+                    return list(entry.get("rows", []))
 
         # Network fetch (no lock — multiple regions/types can fetch in parallel).
         url = f"{ESI_BASE}/markets/{rid}/history/"
@@ -114,6 +125,25 @@ class HistoryStore:
             )
         resp = self.client.get(url, params={"type_id": tid, "datasource": "tranquility"})
         if not resp.ok:
+            if resp.status_code == 404:
+                # ESI rebuilds its history cache after daily restart; 404 is
+                # transient for types with no recent trades. Cache the miss
+                # with a short backoff so we don't retry on every inference
+                # pass and waste rate-limit budget.
+                logger.debug(
+                    "history region=%s type=%s 404 — backoff %ds",
+                    rid, tid, _NOT_FOUND_BACKOFF_S,
+                )
+                with self._lock:
+                    existing_rows = types_map.get(key, {}).get("rows", [])
+                    types_map[key] = {
+                        "fetched_at": time.time(),
+                        "rows": existing_rows,
+                        "not_found": True,
+                    }
+                    self._dirty.add(rid)
+                    self._consecutive_404s += 1
+                return list(existing_rows)
             logger.warning("history region=%s type=%s HTTP %s", rid, tid, resp.status_code)
             with self._lock:
                 entry = types_map.get(key)
@@ -132,7 +162,19 @@ class HistoryStore:
             types_map[key] = {"fetched_at": time.time(), "rows": rows}
             self._dirty.add(rid)
             self._fetch_count += 1
+            self._consecutive_404s = 0  # successful fetch resets the spam counter
         return rows
+
+    @property
+    def is_404_spamming(self) -> bool:
+        """True when more than 10 consecutive live ESI requests returned 404.
+
+        Indicates the post-restart period where ESI hasn't rebuilt its history
+        cache yet. Callers should skip inference passes that depend on history
+        thresholds until this clears.
+        """
+        with self._lock:
+            return self._consecutive_404s > 10
 
     def touched_regions(self) -> set[int]:
         """Return regions that have had at least one fetch since construction."""

@@ -176,7 +176,17 @@ def diff_snapshots(
         removed = [(oid, prev_row) for oid, prev_row in prev.items() if oid not in curr_ids]
         total_removed = len(removed)
         t_p2 = time.monotonic()
+        _spam_skipped = False
         for i, (oid, prev_row) in enumerate(removed, 1):
+            if store.is_404_spamming:
+                if not _spam_skipped:
+                    logger.info(
+                        "inferred: ESI history is returning 404s (post-restart) — "
+                        "skipping removed-order pass for this snapshot (%d/%d done)",
+                        i - 1, total_removed,
+                    )
+                    _spam_skipped = True
+                break
             if i == 1 or i % 100 == 0 or i == total_removed:
                 elapsed = time.monotonic() - t_p2
                 if i > 0:
