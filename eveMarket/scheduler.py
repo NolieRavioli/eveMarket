@@ -159,14 +159,26 @@ class CollectorScheduler:
         while not self.stop_event.is_set():
             now = time.time()
             if now >= next_at:
-                self._run_one()
-                next_at = time.time() + self.interval_s
+                collected_at = self._run_one()
+                # Schedule the next tick from when the snapshot was actually
+                # written (or now if collection failed), not from when we
+                # started waiting. This means if the collection took 4m 30s
+                # and the interval is 5m 1s, we only wait ~31s before the
+                # next check rather than another full 5m 1s.
+                next_at = (collected_at or time.time()) + self.interval_s
             self.stop_event.wait(min(5.0, max(0.5, next_at - time.time())))
 
-    def _run_one(self) -> None:
+    def _run_one(self) -> Optional[float]:
+        """Collect one snapshot; return its unix timestamp, or None on failure.
+
+        Inference and precompute run in a separate daemon thread so the
+        collection lock is released as soon as the snapshot file is written.
+        This lets the loop check immediately whether ESI data has already
+        refreshed again (e.g. if collection took longer than the interval).
+        """
         if not self._running.acquire(blocking=False):
             logger.warning("scheduler: previous collection still running, skipping tick")
-            return
+            return None
         try:
             trigger_unix = int(time.time())
             prev_unix = previous_snapshot(self.data_dir, trigger_unix)
@@ -179,32 +191,45 @@ class CollectorScheduler:
                 )
             except InterruptedError:
                 logger.info("scheduler: collection interrupted")
-                return
+                return None
             except Exception:
                 logger.exception("scheduler: collection failed")
-                return
-
-            if self.on_snapshot is not None:
-                try:
-                    self.on_snapshot(out, total, t_unix)
-                except Exception:
-                    logger.exception("on_snapshot callback failed")
-
-            if self.run_inference and prev_unix is not None:
-                try:
-                    prev_path = orders_path(self.data_dir, prev_unix)
-                    trades = diff_snapshots(prev_path, out,
-                                            data_dir=self.data_dir,
-                                            client=self.client)
-                    inf_path, n = write_inferred(self.data_dir, t_unix, trades)
-                    logger.info("inferred: %s trades -> %s", n, inf_path)
-                except Exception:
-                    logger.exception("inferred-trade computation failed")
-
-            # Precompute /stats + /history for the new snapshot.
-            self._do_precompute(t_unix)
+                return None
         finally:
             self._running.release()
+
+        if self.on_snapshot is not None:
+            try:
+                self.on_snapshot(out, total, t_unix)
+            except Exception:
+                logger.exception("on_snapshot callback failed")
+
+        # Inference and precompute are slow (~50s total). Run them in a
+        # daemon thread so the collection loop is free to start the next
+        # snapshot fetch as soon as the ESI cache window expires.
+        threading.Thread(
+            target=self._post_collect,
+            args=(out, t_unix, prev_unix),
+            name="eveMarket-post-collect",
+            daemon=True,
+        ).start()
+
+        return float(t_unix)
+
+    def _post_collect(self, out: Path, t_unix: int, prev_unix: Optional[int]) -> None:
+        """Inference + precompute + compression sweep for a completed snapshot."""
+        if self.run_inference and prev_unix is not None:
+            try:
+                prev_path = orders_path(self.data_dir, prev_unix)
+                trades = diff_snapshots(prev_path, out,
+                                        data_dir=self.data_dir,
+                                        client=self.client)
+                inf_path, n = write_inferred(self.data_dir, t_unix, trades)
+                logger.info("inferred: %s trades -> %s", n, inf_path)
+            except Exception:
+                logger.exception("inferred-trade computation failed")
+
+        self._do_precompute(t_unix)
 
     def catch_up_precompute(self) -> None:
         """Generate precomputed datasets if missing or stale on startup."""
