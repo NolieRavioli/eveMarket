@@ -23,7 +23,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from eveMarket import EsiClient, CollectorScheduler, ContractScheduler, DowntimeGuard, serve  # noqa: E402
-from eveMarket.sde_download import download_sde  # noqa: E402
+from eveMarket.sde_download import download_sde, fetch_latest_build_number, read_local_build  # noqa: E402
 
 DEFAULT_SDE = HERE / "sde"
 DEFAULT_DATA = HERE / "data"
@@ -56,9 +56,24 @@ def main() -> int:
     )
     log = logging.getLogger("eveMarket")
 
-    if not args.sde.exists():
-        log.info("SDE dir not found at %s — downloading now...", args.sde)
-        download_sde(args.sde, progress=lambda msg, _: log.info("SDE: %s", msg))
+    # Check SDE on every launch: download if missing or behind the live server.
+    try:
+        latest_build = fetch_latest_build_number()
+        local_build = read_local_build(args.sde)
+        if local_build is None or local_build < latest_build:
+            if local_build is None:
+                log.info("SDE not found at %s — downloading build %s...", args.sde, latest_build)
+            else:
+                log.info("SDE is build %s, server is %s — updating...", local_build, latest_build)
+            download_sde(args.sde, build=latest_build,
+                         progress=lambda msg, _: log.info("SDE: %s", msg))
+        else:
+            log.info("SDE is up-to-date (build %s)", local_build)
+    except Exception as exc:  # network error etc — don't abort startup
+        log.warning("SDE update check failed: %s", exc)
+        if not args.sde.exists():
+            log.error("SDE directory missing and update failed — aborting")
+            return 1
     args.data.mkdir(parents=True, exist_ok=True)
 
     client = EsiClient()
