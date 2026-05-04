@@ -54,7 +54,7 @@ from .stats import (
     latest_snapshot_path,
     parse_range,
 )
-from ._browser import BROWSER_HTML as _BROWSER_HTML
+from ._browser import make_browser_html as _make_browser_html
 
 logger = logging.getLogger(__name__)
 
@@ -606,7 +606,12 @@ def _make_handler(state: MarketState):
 
             # ----- browser UI -----
             if head == "browser" and len(parts) == 1:
-                return self._send_html(_BROWSER_HTML)
+                from . import sde_market as _sdm
+                html = _make_browser_html(
+                    _sdm.market_group_tree(state.sde_dir),
+                    _sdm.regions_list(state.sde_dir),
+                )
+                return self._send_html(html)
 
             # ----- browser JSON API -----
             if head == "api" and len(parts) >= 2:

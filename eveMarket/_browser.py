@@ -1,917 +1,676 @@
-"""Browser UI HTML — served at GET /browser."""
+"""Browser UI HTML — served at GET /browser.
 
-BROWSER_HTML: bytes = """<!DOCTYPE html>
+Call make_browser_html(tree, regions) with the results from sde_market to
+get a bytes HTML page.  The market-group tree and region list are embedded
+directly in the page as JS constants, so there are zero API round-trips on
+initial load — the tree appears instantly.  The only network calls made by
+the page are when the user actually selects an item.
+"""
+import json
+
+# ---------------------------------------------------------------------------
+# Template — two placeholders replaced by make_browser_html()
+# ---------------------------------------------------------------------------
+
+_TMPL = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>EVE Market Browser</title>
+<title>EVE Market</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
 <style>
-:root{
-  --bg:#0a0d14;--bg2:#10141f;--bg3:#161b2e;--bg4:#1a2035;
-  --border:#2a3050;--border2:#3a4060;
-  --text:#b0bcd4;--text2:#7a8aaa;--head:#d0ddf0;
-  --accent:#4a90d9;--accent2:#6aaeff;
-  --sell:#e05050;--sell2:#ff7070;
-  --buy:#40a850;--buy2:#60c870;
-  --warn:#d09030;
-  --sidebar:290px;
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+:root {
+  --bg:  #0b0d14; --bg2: #111420; --bg3: #161b2e; --bg4: #1b2138;
+  --bd:  #252d45; --bd2: #2e3858;
+  --tx:  #8a9bb8; --tx2: #56687a; --hd:  #c5d6ee;
+  --ac:  #3e7cb5; --ac2: #5592cc;
+  --sl:  #c04040; --sl2: #e06060;
+  --by:  #358a46; --by2: #48c060;
 }
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px}
+html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--tx);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif }
 
-/* Layout */
-#app{display:flex;height:100vh}
-#sidebar{width:var(--sidebar);min-width:var(--sidebar);display:flex;flex-direction:column;background:var(--bg2);border-right:1px solid var(--border);overflow:hidden}
-#main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+/* ── Layout ── */
+#wrap  { display: flex; height: 100vh }
+#side  { width: 270px; flex-shrink: 0; display: flex; flex-direction: column;
+         background: var(--bg2); border-right: 1px solid var(--bd); overflow: hidden }
+#main  { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0 }
 
-/* Sidebar search */
-#search-wrap{padding:10px;border-bottom:1px solid var(--border);flex-shrink:0}
-#search-input{width:100%;background:var(--bg3);border:1px solid var(--border2);border-radius:4px;padding:6px 10px;color:var(--head);font-size:13px;outline:none}
-#search-input:focus{border-color:var(--accent)}
-#search-input::placeholder{color:var(--text2)}
+/* ── Search ── */
+#sq    { padding: 7px; border-bottom: 1px solid var(--bd); flex-shrink: 0; position: relative }
+#si    { width: 100%; background: var(--bg3); border: 1px solid var(--bd2); border-radius: 4px;
+         padding: 5px 8px 5px 26px; color: var(--hd); font-size: 13px; outline: none }
+#si::placeholder { color: var(--tx2) }
+#si:focus { border-color: var(--ac2) }
+#si-ic { position: absolute; left: 15px; top: 50%; transform: translateY(-50%);
+         color: var(--tx2); font-size: 11px; pointer-events: none }
+#sr    { display: none; position: absolute; left: 7px; right: 7px; top: 100%; z-index: 50;
+         background: var(--bg3); border: 1px solid var(--bd2);
+         border-radius: 0 0 4px 4px; max-height: 320px; overflow-y: auto }
+#sr.on { display: block }
+.ri    { padding: 5px 10px; cursor: pointer; border-bottom: 1px solid var(--bd) }
+.ri:last-child { border-bottom: none }
+.ri:hover, .ri.foc { background: var(--bg4) }
+.ri-n  { color: var(--hd); font-size: 13px }
+.ri-g  { color: var(--tx2); font-size: 11px }
+.r-msg { padding: 10px; text-align: center; color: var(--tx2); font-size: 12px }
 
-/* Tree */
-#tree-wrap{flex:1;overflow-y:auto;overflow-x:hidden}
-#tree-list-wrap{display:none;border-top:1px solid var(--border);flex-shrink:0;overflow-y:auto;max-height:45%}
-#type-list-header{padding:6px 10px;font-size:11px;color:var(--text2);background:var(--bg3);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
-#type-list-header button{background:none;border:none;color:var(--text2);cursor:pointer;font-size:14px;line-height:1}
-#type-list{overflow-y:auto;flex:1}
-.type-item{padding:5px 12px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
-.type-item:hover{background:var(--bg4);color:var(--head)}
-.type-item.active{background:var(--bg4);color:var(--accent2);font-weight:600}
+/* ── Nav (tree / type-list) ── */
+#nav   { flex: 1; overflow: hidden; display: flex; flex-direction: column }
+.view  { display: none; flex: 1; flex-direction: column; overflow: hidden }
+.view.on { display: flex }
+#tv    { overflow-y: auto }
 
 /* Tree nodes */
-.tree-node{user-select:none}
-.tree-row{display:flex;align-items:center;padding:3px 6px;cursor:pointer;white-space:nowrap;overflow:hidden}
-.tree-row:hover{background:var(--bg4)}
-.tree-row.active-group{color:var(--accent2)}
-.tree-toggle{color:var(--text2);font-size:10px;width:14px;flex-shrink:0;transition:transform 0.1s}
-.tree-toggle.open{transform:rotate(90deg)}
-.tree-name{overflow:hidden;text-overflow:ellipsis;flex:1}
-.tree-children{display:none}
-.tree-children.open{display:block}
+.tn-row  { display: flex; align-items: center; padding: 4px 6px; cursor: pointer;
+           border-bottom: 1px solid var(--bd); white-space: nowrap; overflow: hidden }
+.tn-row:hover { background: var(--bg3) }
+.tn-caret { width: 14px; font-size: 10px; color: var(--tx2); flex-shrink: 0;
+            text-align: center; transition: transform .12s }
+.tn-caret.op { transform: rotate(90deg) }
+.tn-lbl  { overflow: hidden; text-overflow: ellipsis; font-size: 13px; flex: 1 }
+.tn-kids { display: none }
+.tn-kids.op { display: block }
 
-/* Main tabs / panels */
-#empty-state{flex:1;display:flex;align-items:center;justify-content:center;color:var(--text2);font-size:14px;flex-direction:column;gap:8px}
-#empty-state .hint{font-size:12px;color:var(--border2)}
-#item-panel{flex:1;display:none;flex-direction:column;overflow:hidden}
+/* Type list */
+#tl-hdr  { display: flex; align-items: center; gap: 6px; padding: 6px 8px;
+           background: var(--bg3); border-bottom: 1px solid var(--bd); flex-shrink: 0 }
+#tl-back { background: none; border: none; color: var(--ac2); cursor: pointer;
+           font-size: 18px; padding: 0 2px; line-height: 1 }
+#tl-back:hover { color: var(--hd) }
+#tl-name { font-size: 12px; font-weight: 600; color: var(--hd);
+           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 }
+#tl-body { flex: 1; overflow-y: auto }
+.trow    { padding: 5px 12px; cursor: pointer; border-bottom: 1px solid var(--bd);
+           font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.trow:hover { background: var(--bg4); color: var(--hd) }
+.trow.sel   { color: var(--ac2); background: var(--bg4) }
+
+/* ── Empty / Item panels ── */
+#mp-empty { flex: 1; display: flex; align-items: center; justify-content: center;
+            flex-direction: column; gap: 8px; color: var(--tx2) }
+#mp-empty b     { font-size: 15px; color: var(--hd) }
+#mp-empty small { font-size: 11px }
+#mp-item  { flex: 1; display: none; flex-direction: column; overflow: hidden }
+#mp-item.on { display: flex }
 
 /* Item header */
-#item-header{display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--bg2);border-bottom:1px solid var(--border);flex-shrink:0}
-#item-icon{width:48px;height:48px;border-radius:4px;background:var(--bg3);flex-shrink:0}
-#item-meta{min-width:0}
-#item-breadcrumb{font-size:11px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#item-name{font-size:18px;font-weight:600;color:var(--head);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#ih    { display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+         background: var(--bg2); border-bottom: 1px solid var(--bd); flex-shrink: 0 }
+#ii    { width: 48px; height: 48px; border-radius: 3px; background: var(--bg3);
+         flex-shrink: 0; object-fit: cover }
+#im    { flex: 1; min-width: 0 }
+#ipath { font-size: 11px; color: var(--tx2); white-space: nowrap;
+         overflow: hidden; text-overflow: ellipsis }
+#iname { font-size: 17px; font-weight: 600; color: var(--hd); white-space: nowrap;
+         overflow: hidden; text-overflow: ellipsis }
+#isc-w  { flex-shrink: 0; display: flex; align-items: center; gap: 6px }
+#isc-lb { font-size: 11px; color: var(--tx2) }
+#isc    { background: var(--bg3); border: 1px solid var(--bd2); border-radius: 4px;
+          padding: 4px 7px; color: var(--hd); font-size: 12px; outline: none; cursor: pointer }
+#isc:focus { border-color: var(--ac2) }
 
-/* Scrollable content */
-#content-scroll{flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:14px}
+/* Stats bar */
+#sb     { display: flex; border-bottom: 1px solid var(--bd); flex-shrink: 0; background: var(--bg2) }
+.st     { flex: 1; padding: 5px 10px; border-right: 1px solid var(--bd); min-width: 0 }
+.st:last-child { border-right: none }
+.st-l   { font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+          color: var(--tx2); white-space: nowrap }
+.st-v   { font-size: 13px; font-weight: 600; color: var(--hd);
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.st-v.s { color: var(--sl2) }
+.st-v.b { color: var(--by2) }
 
-/* Stats cards */
-#stats-cards{display:flex;gap:10px;flex-wrap:wrap}
-.stat-card{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;min-width:110px;flex:1}
-.stat-label{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--text2);margin-bottom:3px}
-.stat-val{font-size:15px;font-weight:600;color:var(--head)}
-.stat-val.sell-c{color:var(--sell2)}
-.stat-val.buy-c{color:var(--buy2)}
-.stat-val.neutral{color:var(--text)}
+/* Item body */
+#ib     { flex: 1; overflow-y: auto; padding: 10px; display: flex;
+          flex-direction: column; gap: 10px }
+.bx     { background: var(--bg2); border: 1px solid var(--bd); border-radius: 5px; overflow: hidden }
+.bx-h   { display: flex; align-items: center; justify-content: space-between;
+          padding: 6px 10px; background: var(--bg3); border-bottom: 1px solid var(--bd) }
+.bx-t   { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em }
+.bx-t.s { color: var(--sl2) }
+.bx-t.b { color: var(--by2) }
+.bx-t.n { color: var(--tx2) }
+.bx-m   { font-size: 11px; color: var(--tx2) }
+#ch-el  { padding: 8px 4px }
+.uplot  { background: transparent !important }
 
-/* Section cards */
-.section{background:var(--bg2);border:1px solid var(--border);border-radius:6px;overflow:hidden}
-.section-header{padding:8px 12px;background:var(--bg3);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
-.section-title{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text2)}
-.section-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-
-/* Form controls */
-select,input[type=text],input[type=number]{background:var(--bg3);border:1px solid var(--border2);border-radius:3px;padding:3px 7px;color:var(--head);font-size:12px;outline:none}
-select:focus,input:focus{border-color:var(--accent)}
-select option{background:var(--bg2)}
-label{font-size:11px;color:var(--text2)}
-
-/* Chart */
-#chart-wrap{padding:10px 12px;min-height:200px}
-.uplot canvas{display:block}
-
-/* Orders tables */
-.orders-wrap{overflow-x:auto}
-table{width:100%;border-collapse:collapse}
-thead th{padding:6px 10px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--text2);border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg3);cursor:pointer;user-select:none;white-space:nowrap}
-thead th:hover{color:var(--head)}
-thead th .sort-arrow{opacity:.4;margin-left:4px;font-size:9px}
-thead th.asc .sort-arrow::after{content:'▲'}
-thead th.desc .sort-arrow::after{content:'▼'}
-thead th:not(.asc):not(.desc) .sort-arrow::after{content:'⇅'}
-tbody tr{border-bottom:1px solid var(--border)}
-tbody tr:hover{background:var(--bg4)}
-tbody td{padding:5px 10px;white-space:nowrap}
-.price-sell{color:var(--sell2)}
-.price-buy{color:var(--buy2)}
-.sec-high{color:#5bc85b}
-.sec-med{color:#f0c040}
-.sec-low{color:#e07030}
-.sec-null{color:#c03030}
-.loading{padding:20px;text-align:center;color:var(--text2)}
-.no-data{padding:14px;text-align:center;color:var(--text2);font-size:12px}
-
-/* Filter bar */
-#filter-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-#filter-bar label{display:flex;align-items:center;gap:4px}
-#filter-bar input[type=text]{width:130px}
-#filter-bar input[type=number]{width:70px}
-
-/* Scrollbars */
-::-webkit-scrollbar{width:6px;height:6px}
-::-webkit-scrollbar-track{background:var(--bg2)}
-::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
-
-/* Loading spinner */
-.spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px}
-@keyframes spin{to{transform:rotate(360deg)}}
-
-/* Responsive: hide sidebar label on very small */
-@media(max-width:600px){:root{--sidebar:200px}}
+/* Tables */
+.tw     { overflow-x: auto }
+table   { width: 100%; border-collapse: collapse }
+thead th { padding: 5px 8px; font-size: 10px; text-transform: uppercase;
+           letter-spacing: .05em; color: var(--tx2); border-bottom: 1px solid var(--bd);
+           text-align: left; cursor: pointer; white-space: nowrap; user-select: none;
+           background: var(--bg3); position: sticky; top: 0 }
+thead th:hover { color: var(--hd) }
+thead th.asc::after  { content: " \2191"; color: var(--ac2) }
+thead th.desc::after { content: " \2193"; color: var(--ac2) }
+tbody td { padding: 4px 8px; border-bottom: 1px solid var(--bd); white-space: nowrap; font-size: 12px }
+tbody tr:last-child td { border-bottom: none }
+tbody tr:hover td  { background: var(--bg4) }
+.ps  { color: var(--sl2); font-weight: 600 }
+.pb  { color: var(--by2); font-weight: 600 }
+.loc { color: var(--hd) }
+.rgn { color: var(--tx2); font-size: 11px }
+.h5  { color: #4ec44e } .h4 { color: #8bca4e } .h3 { color: #c8c840 }
+.h2  { color: #d48030 } .h1 { color: #c84020 } .h0 { color: #b01818 }
+.msg { padding: 12px; text-align: center; color: var(--tx2); font-size: 12px }
+.sp  { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--bd2);
+       border-top-color: var(--ac2); border-radius: 50%;
+       animation: spin .6s linear infinite; vertical-align: middle; margin-right: 4px }
+@keyframes spin { to { transform: rotate(360deg) } }
+::-webkit-scrollbar       { width: 5px; height: 5px }
+::-webkit-scrollbar-track { background: var(--bg2) }
+::-webkit-scrollbar-thumb { background: var(--bd2); border-radius: 3px }
 </style>
 </head>
 <body>
-<div id="app">
-
-  <!-- ===== SIDEBAR ===== -->
-  <aside id="sidebar">
-    <div id="search-wrap">
-      <input id="search-input" type="text" placeholder="&#128269; Search items...">
-    </div>
-    <div id="tree-wrap">
-      <div id="tree-container"></div>
-    </div>
-    <div id="tree-list-wrap">
-      <div id="type-list-header">
-        <span id="type-list-title">Items</span>
-        <button id="type-list-close" title="Close">&times;</button>
+<div id="wrap">
+<aside id="side">
+  <div id="sq">
+    <span id="si-ic">&#9906;</span>
+    <input id="si" type="search" placeholder="Search all items..." autocomplete="off">
+    <div id="sr"></div>
+  </div>
+  <div id="nav">
+    <div id="tv" class="view on"></div>
+    <div id="tlv" class="view">
+      <div id="tl-hdr">
+        <button id="tl-back">&#8592;</button>
+        <span id="tl-name"></span>
       </div>
-      <div id="type-list"></div>
+      <div id="tl-body"></div>
     </div>
-  </aside>
-
-  <!-- ===== MAIN ===== -->
-  <main id="main">
-    <div id="empty-state">
-      <div>&#9432; Select an item from the left panel</div>
-      <div class="hint">Market group tree &rarr; item group &rarr; click an item</div>
-    </div>
-
-    <div id="item-panel">
-      <!-- Item header -->
-      <div id="item-header">
-        <img id="item-icon" src="" alt="">
-        <div id="item-meta">
-          <div id="item-breadcrumb"></div>
-          <div id="item-name">Loading...</div>
-        </div>
-        <div id="item-loading" style="margin-left:auto;display:none"><span class="spinner"></span></div>
+  </div>
+</aside>
+<main id="main">
+  <div id="mp-empty">
+    <b>EVE Market Browser</b>
+    <small>Browse the tree on the left or search for an item</small>
+  </div>
+  <div id="mp-item">
+    <div id="ih">
+      <img id="ii" src="" alt="">
+      <div id="im">
+        <div id="ipath"></div>
+        <div id="iname"></div>
       </div>
-
-      <!-- Scrollable content area -->
-      <div id="content-scroll">
-
-        <!-- Stats cards -->
-        <div id="stats-cards">
-          <div class="stat-card"><div class="stat-label">Best Sell</div><div class="stat-val sell-c" id="st-sell">&mdash;</div></div>
-          <div class="stat-card"><div class="stat-label">Best Buy</div><div class="stat-val buy-c" id="st-buy">&mdash;</div></div>
-          <div class="stat-card"><div class="stat-label">Spread</div><div class="stat-val neutral" id="st-spread">&mdash;</div></div>
-          <div class="stat-card"><div class="stat-label">Sell Volume</div><div class="stat-val neutral" id="st-svol">&mdash;</div></div>
-          <div class="stat-card"><div class="stat-label">Buy Volume</div><div class="stat-val neutral" id="st-bvol">&mdash;</div></div>
-          <div class="stat-card"><div class="stat-label">Orders</div><div class="stat-val neutral" id="st-orders">&mdash;</div></div>
+      <div id="isc-w">
+        <span id="isc-lb">Region</span>
+        <select id="isc"><option value="all">All Regions</option></select>
+      </div>
+    </div>
+    <div id="sb">
+      <div class="st"><div class="st-l">Best Sell</div><div id="st-sl" class="st-v s">&mdash;</div></div>
+      <div class="st"><div class="st-l">Best Buy</div> <div id="st-by" class="st-v b">&mdash;</div></div>
+      <div class="st"><div class="st-l">Margin</div>   <div id="st-mg" class="st-v">&mdash;</div></div>
+      <div class="st"><div class="st-l">Sell Vol</div> <div id="st-sv" class="st-v">&mdash;</div></div>
+      <div class="st"><div class="st-l">Buy Vol</div>  <div id="st-bv" class="st-v">&mdash;</div></div>
+      <div class="st"><div class="st-l">Orders</div>   <div id="st-or" class="st-v">&mdash;</div></div>
+    </div>
+    <div id="ib">
+      <div class="bx">
+        <div class="bx-h">
+          <span class="bx-t n">Price History</span>
+          <span class="bx-m" id="ch-meta"></span>
         </div>
-
-        <!-- Price History -->
-        <div class="section">
-          <div class="section-header">
-            <span class="section-title">Price History</span>
-            <div class="section-controls">
-              <label>Region:
-                <select id="hist-region">
-                  <option value="all">All Regions</option>
-                </select>
-              </label>
-              <label>Or station (regex):
-                <input type="text" id="hist-station" placeholder="Jita|Amarr...">
-              </label>
-            </div>
-          </div>
-          <div id="chart-wrap">
-            <div class="no-data" id="chart-empty">No history data cached for this item/region.</div>
-          </div>
+        <div id="ch-el"><div class="msg">Select an item to view history.</div></div>
+      </div>
+      <div class="bx">
+        <div class="bx-h">
+          <span class="bx-t s">&#9660; Sell Orders</span>
+          <span class="bx-m" id="sl-meta"></span>
         </div>
-
-        <!-- Orders filter bar -->
-        <div class="section">
-          <div class="section-header">
-            <span class="section-title">Order Filters</span>
-            <div id="filter-bar">
-              <label>Region:
-                <select id="f-region"><option value="">All</option></select>
-              </label>
-              <label>Station (regex):
-                <input type="text" id="f-station" placeholder="Jita|Amarr...">
-              </label>
-              <label>Max price:
-                <input type="number" id="f-maxprice" placeholder="ISK" min="0" step="any">
-              </label>
-              <label>Min qty:
-                <input type="number" id="f-minqty" placeholder="units" min="1" step="1">
-              </label>
-            </div>
-          </div>
+        <div class="tw">
+          <table>
+            <thead><tr id="sl-hdr">
+              <th data-c="price" data-t="s">Price</th>
+              <th data-c="volume_remain" data-t="s">Qty</th>
+              <th data-c="loc" data-t="s">Location</th>
+              <th data-c="sec" data-t="s">Sec</th>
+              <th data-c="exp" data-t="s">Expires</th>
+            </tr></thead>
+            <tbody id="sl-body"><tr><td colspan="5" class="msg">Select an item.</td></tr></tbody>
+          </table>
         </div>
-
-        <!-- Sell orders -->
-        <div class="section">
-          <div class="section-header">
-            <span class="section-title" style="color:var(--sell2)">&#9660; Sell Orders</span>
-            <span id="sell-count" style="font-size:11px;color:var(--text2)"></span>
-          </div>
-          <div class="orders-wrap">
-            <table id="sell-table">
-              <thead>
-                <tr>
-                  <th data-col="price" data-tbl="sell">Price <span class="sort-arrow"></span></th>
-                  <th data-col="volume_remain" data-tbl="sell">Qty <span class="sort-arrow"></span></th>
-                  <th data-col="region_name" data-tbl="sell">Region <span class="sort-arrow"></span></th>
-                  <th data-col="location_id" data-tbl="sell">Location <span class="sort-arrow"></span></th>
-                  <th data-col="security_status" data-tbl="sell">Sec <span class="sort-arrow"></span></th>
-                  <th data-col="issued" data-tbl="sell">Expires <span class="sort-arrow"></span></th>
-                </tr>
-              </thead>
-              <tbody id="sell-body"><tr><td colspan="6" class="no-data">Select an item to view orders.</td></tr></tbody>
-            </table>
-          </div>
+      </div>
+      <div class="bx">
+        <div class="bx-h">
+          <span class="bx-t b">&#9650; Buy Orders</span>
+          <span class="bx-m" id="by-meta"></span>
         </div>
-
-        <!-- Buy orders -->
-        <div class="section">
-          <div class="section-header">
-            <span class="section-title" style="color:var(--buy2)">&#9650; Buy Orders</span>
-            <span id="buy-count" style="font-size:11px;color:var(--text2)"></span>
-          </div>
-          <div class="orders-wrap">
-            <table id="buy-table">
-              <thead>
-                <tr>
-                  <th data-col="price" data-tbl="buy">Price <span class="sort-arrow"></span></th>
-                  <th data-col="volume_remain" data-tbl="buy">Qty <span class="sort-arrow"></span></th>
-                  <th data-col="range" data-tbl="buy">Range <span class="sort-arrow"></span></th>
-                  <th data-col="min_volume" data-tbl="buy">Min Vol <span class="sort-arrow"></span></th>
-                  <th data-col="region_name" data-tbl="buy">Region <span class="sort-arrow"></span></th>
-                  <th data-col="location_id" data-tbl="buy">Location <span class="sort-arrow"></span></th>
-                  <th data-col="security_status" data-tbl="buy">Sec <span class="sort-arrow"></span></th>
-                  <th data-col="issued" data-tbl="buy">Expires <span class="sort-arrow"></span></th>
-                </tr>
-              </thead>
-              <tbody id="buy-body"><tr><td colspan="8" class="no-data">Select an item to view orders.</td></tr></tbody>
-            </table>
-          </div>
+        <div class="tw">
+          <table>
+            <thead><tr id="by-hdr">
+              <th data-c="price" data-t="b">Price</th>
+              <th data-c="volume_remain" data-t="b">Qty</th>
+              <th data-c="range" data-t="b">Range</th>
+              <th data-c="min_volume" data-t="b">Min Vol</th>
+              <th data-c="loc" data-t="b">Location</th>
+              <th data-c="sec" data-t="b">Sec</th>
+              <th data-c="exp" data-t="b">Expires</th>
+            </tr></thead>
+            <tbody id="by-body"><tr><td colspan="7" class="msg">Select an item.</td></tr></tbody>
+          </table>
         </div>
-
-      </div><!-- /content-scroll -->
-    </div><!-- /item-panel -->
-  </main>
+      </div>
+    </div>
+  </div>
+</main>
 </div>
-
 <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
 <script>
-'use strict';
+/* ── Embedded SDE data (no API round-trips needed) ── */
+const TREE    = /*TREE*/;
+const REGIONS = /*REGIONS*/;
 
-// ============================================================
-// State
-// ============================================================
-let allRegions = [];
-let allOrders = [];        // raw orders for current type
-let filteredSells = [];
-let filteredBuys = [];
-let currentTypeId = null;
-let currentTypeName = '';
-let nameCache = {};        // id -> name string
-let nameQueue = new Set(); // ids waiting for batch resolve
-let nameResolveTimer = null;
-let chartInst = null;
-let sortState = {sell:{col:'price',dir:'asc'}, buy:{col:'price',dir:'desc'}};
+/* ── Helpers ── */
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 
-// ============================================================
-// Utility
-// ============================================================
-function fmt(n, decimals=2){
-  if(n==null||isNaN(n))return '\u2014';
-  if(n>=1e12)return(n/1e12).toFixed(2)+'T';
-  if(n>=1e9)return(n/1e9).toFixed(2)+'B';
-  if(n>=1e6)return(n/1e6).toFixed(2)+'M';
-  if(n>=1e3)return(n/1e3).toFixed(2)+'K';
-  return n.toFixed(decimals);
+function fmtISK(v) {
+  if (v == null || isNaN(v)) return '\u2014';
+  if (v >= 1e12) return (v/1e12).toFixed(2)+' T';
+  if (v >= 1e9)  return (v/1e9).toFixed(2)+' B';
+  if (v >= 1e6)  return (v/1e6).toFixed(2)+' M';
+  if (v >= 1e3)  return (v/1e3).toFixed(1)+' K';
+  return v.toLocaleString(undefined, {maximumFractionDigits: 2});
 }
-function fmtISK(n){
-  if(n==null||isNaN(n))return '\u2014';
-  return fmt(n)+' ISK';
+function fmtN(v) { return v == null ? '\u2014' : Number(v).toLocaleString(); }
+function secCls(s) {
+  const v = s == null ? -1 : Math.max(0, s);
+  if (v >= 0.9) return 'h5'; if (v >= 0.5) return 'h4';
+  if (v >= 0.3) return 'h3'; if (v >= 0.1) return 'h2';
+  if (v >  0  ) return 'h1'; return 'h0';
 }
-function fmtNum(n){
-  if(n==null||isNaN(n))return '\u2014';
-  return n.toLocaleString();
+function fmtSec(s) { return s == null ? '?' : Math.max(0, s).toFixed(1); }
+function fmtExp(issued, dur) {
+  if (!issued) return '\u2014';
+  const ms = new Date(issued).getTime() + (dur || 0)*86400000 - Date.now();
+  if (ms < 0) return 'expired';
+  const d = Math.floor(ms / 86400000);
+  if (d >= 1) return d + 'd';
+  return Math.floor(ms / 3600000) + 'h';
 }
-function fmtDate(s){
-  if(!s)return '';
-  return s.slice(0,10);
-}
-function secColor(sec){
-  if(sec==null)return 'sec-null';
-  if(sec>=0.5)return 'sec-high';
-  if(sec>=0.1)return 'sec-med';
-  if(sec>0)return 'sec-low';
-  return 'sec-null';
-}
-function fmtSec(sec){
-  if(sec==null)return '?';
-  const v=Math.max(0,Math.min(1,sec));
-  return v.toFixed(1);
-}
-function expiresDate(issued, durationDays){
-  if(!issued)return '';
-  const d=new Date(issued);
-  d.setDate(d.getDate()+(durationDays||0));
-  return d.toISOString().slice(0,10);
+function pct(sorted, p) {
+  if (!sorted.length) return null;
+  return sorted[Math.max(0, Math.ceil(sorted.length * p) - 1)];
 }
 
-// ============================================================
-// Name resolution via /api/names
-// ============================================================
-function resolveNames(ids, callback){
-  // Check cache first
-  const need=ids.filter(id=>!(id in nameCache));
-  if(!need.length){callback(ids.map(id=>nameCache[id]||String(id)));return;}
-  need.forEach(id=>nameQueue.add(id));
-  if(nameResolveTimer)clearTimeout(nameResolveTimer);
-  nameResolveTimer=setTimeout(flushNameQueue,400);
-  // Return immediately with IDs; caller can re-render when names arrive
-  callback(ids.map(id=>nameCache[id]||String(id)));
+/* ── State ── */
+const S = {
+  tid: null,
+  orders: [],
+  names: {},
+  chart: null,
+  sort: { s: {c:'price',d:'asc'}, b: {c:'price',d:'desc'} },
+};
+
+/* ── Populate region selector from inlined data ── */
+(function() {
+  const sel = $('isc');
+  for (const r of REGIONS) {
+    const o = document.createElement('option');
+    o.value = String(r.id); o.textContent = r.name;
+    sel.appendChild(o);
+  }
+})();
+
+$('isc').addEventListener('change', () => {
+  if (!S.tid) return;
+  computeStats(); renderTables(); loadHistory(S.tid);
+});
+function regionId() { const v = $('isc').value; return v === 'all' ? null : +v; }
+
+/* ── Search ── */
+let sdebounce = null, sfocus = -1;
+$('si').addEventListener('input', e => {
+  clearTimeout(sdebounce);
+  const q = e.target.value.trim();
+  if (!q) { hideSearch(); return; }
+  sdebounce = setTimeout(() => doSearch(q), 220);
+});
+$('si').addEventListener('keydown', e => {
+  const items = $('sr').querySelectorAll('.ri');
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    sfocus = Math.min(sfocus+1, items.length-1);
+    items.forEach((el,i) => el.classList.toggle('foc', i===sfocus));
+    if (items[sfocus]) items[sfocus].scrollIntoView({block:'nearest'});
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    sfocus = Math.max(sfocus-1, 0);
+    items.forEach((el,i) => el.classList.toggle('foc', i===sfocus));
+    if (items[sfocus]) items[sfocus].scrollIntoView({block:'nearest'});
+  } else if (e.key === 'Enter') {
+    const t = items[sfocus >= 0 ? sfocus : 0];
+    if (t) t.dispatchEvent(new MouseEvent('mousedown'));
+  } else if (e.key === 'Escape') { hideSearch(); }
+});
+$('si').addEventListener('blur', () => setTimeout(hideSearch, 150));
+function hideSearch() { $('sr').classList.remove('on'); sfocus = -1; }
+
+async function doSearch(q) {
+  const sr = $('sr');
+  sr.innerHTML = '<div class="r-msg"><span class="sp"></span></div>';
+  sr.classList.add('on'); sfocus = -1;
+  try {
+    const res = await fetch('/api/search_types?q=' + encodeURIComponent(q)).then(r => r.json());
+    if (!res.length) { sr.innerHTML = '<div class="r-msg">No results</div>'; return; }
+    sr.innerHTML = '';
+    for (const m of res) {
+      const d = document.createElement('div');
+      d.className = 'ri';
+      d.innerHTML = '<div class="ri-n">'+esc(m.name)+'</div><div class="ri-g">'+esc(m.groupName)+'</div>';
+      d.addEventListener('mousedown', () => { $('si').value = ''; hideSearch(); selectType(m.id, m.name); });
+      sr.appendChild(d);
+    }
+    if (res.length === 100) {
+      const more = document.createElement('div');
+      more.className = 'r-msg'; more.textContent = 'Showing top 100 \u2014 refine your search';
+      sr.appendChild(more);
+    }
+  } catch(e) { sr.innerHTML = '<div class="r-msg">Search failed</div>'; }
 }
-async function flushNameQueue(){
-  const ids=[...nameQueue];nameQueue.clear();
-  if(!ids.length)return;
-  try{
-    const resp=await fetch('/api/names?ids='+ids.join(','));
-    if(!resp.ok)return;
-    const map=await resp.json();
-    Object.assign(nameCache,map);
-    // Re-render if we have orders loaded
-    if(allOrders.length)applyFiltersAndRender();
-  }catch(e){}
-}
 
-// ============================================================
-// Tree rendering
-// ============================================================
-function renderTree(groups){
-  const container=document.getElementById('tree-container');
-  container.innerHTML='';
-  for(const g of groups) container.appendChild(makeTreeNode(g,0));
-}
+/* ── Tree (rendered from inlined TREE constant) ── */
+(function buildTree() {
+  const tv = $('tv');
+  for (const node of TREE) tv.appendChild(mkNode(node, 0));
+})();
 
-function makeTreeNode(node,depth){
-  const div=document.createElement('div');
-  div.className='tree-node';
-  const row=document.createElement('div');
-  row.className='tree-row';
-  row.style.paddingLeft=(8+depth*14)+'px';
+function mkNode(node, depth) {
+  const wrap = document.createElement('div');
+  const row  = document.createElement('div');
+  row.className = 'tn-row';
+  row.style.paddingLeft = (6 + depth*14) + 'px';
 
-  const hasChildren=node.children&&node.children.length>0;
-  const toggle=document.createElement('span');
-  toggle.className='tree-toggle';
-  toggle.textContent=hasChildren?'\u25BA':'\u00A0';
-  const name=document.createElement('span');
-  name.className='tree-name';
-  name.textContent=node.name;
-  row.appendChild(toggle);
-  row.appendChild(name);
-  div.appendChild(row);
+  const hasKids = node.children && node.children.length > 0;
+  const car = document.createElement('span');
+  car.className = 'tn-caret';
+  car.textContent = hasKids ? '\u25BA' : ' ';
 
-  let childrenDiv=null;
-  if(hasChildren){
-    childrenDiv=document.createElement('div');
-    childrenDiv.className='tree-children';
-    for(const child of node.children)
-      childrenDiv.appendChild(makeTreeNode(child,depth+1));
-    div.appendChild(childrenDiv);
-    row.addEventListener('click',e=>{
-      e.stopPropagation();
-      const open=childrenDiv.classList.toggle('open');
-      toggle.classList.toggle('open',open);
-    });
+  const lbl = document.createElement('span');
+  lbl.className = 'tn-lbl'; lbl.textContent = node.name;
+
+  row.appendChild(car); row.appendChild(lbl);
+  wrap.appendChild(row);
+
+  let kidsEl = null;
+  if (hasKids) {
+    kidsEl = document.createElement('div');
+    kidsEl.className = 'tn-kids';
+    for (const c of node.children) kidsEl.appendChild(mkNode(c, depth+1));
+    wrap.appendChild(kidsEl);
   }
 
-  // Group that might have types - clicking loads them
-  row.addEventListener('click',e=>{
-    if(hasChildren)return; // handled above
-    loadGroupTypes(node.id,node.name);
-    document.querySelectorAll('.tree-row.active-group')
-      .forEach(r=>r.classList.remove('active-group'));
-    row.classList.add('active-group');
+  row.addEventListener('click', e => {
+    e.stopPropagation();
+    if (hasKids) {
+      const op = kidsEl.classList.toggle('op');
+      car.classList.toggle('op', op);
+      car.textContent = op ? '\u25BC' : '\u25BA';
+    }
+    if (node.hasTypes || !hasKids) openGroup(node.id, node.name);
   });
-  // For parent nodes, also allow clicking name to open type list
-  if(hasChildren){
-    name.addEventListener('click',e=>{
-      e.stopPropagation();
-      loadGroupTypes(node.id,node.name);
-      document.querySelectorAll('.tree-row.active-group')
-        .forEach(r=>r.classList.remove('active-group'));
-      row.classList.add('active-group');
-    });
-  }
-
-  div.dataset.id=node.id;
-  div.dataset.name=node.name.toLowerCase();
-  return div;
+  return wrap;
 }
 
-function filterTree(query){
-  const q=query.toLowerCase().trim();
-  const nodes=document.querySelectorAll('.tree-node');
-  nodes.forEach(node=>{
-    if(!q){node.style.display='';return;}
-    const name=node.dataset.name||'';
-    node.style.display=name.includes(q)?'':'none';
-  });
-}
-
-// ============================================================
-// Type list panel
-// ============================================================
-let currentGroupTypes=[];
-
-async function loadGroupTypes(groupId,groupName){
-  const wrap=document.getElementById('tree-list-wrap');
-  const listEl=document.getElementById('type-list');
-  const titleEl=document.getElementById('type-list-title');
-  wrap.style.display='flex';
-  wrap.style.flexDirection='column';
-  titleEl.textContent=groupName;
-  listEl.innerHTML='<div class="loading"><span class="spinner"></span>Loading...</div>';
-
-  try{
-    const types=await fetch('/api/types/'+groupId).then(r=>r.json());
-    currentGroupTypes=types;
-    renderTypeList(types);
-  }catch(e){
-    listEl.innerHTML='<div class="no-data">Error loading items</div>';
-  }
-}
-
-function renderTypeList(types, filter=''){
-  const listEl=document.getElementById('type-list');
-  const q=filter.toLowerCase().trim();
-  const shown=q?types.filter(t=>t.name.toLowerCase().includes(q)):types;
-  if(!shown.length){listEl.innerHTML='<div class="no-data">No items found</div>';return;}
-  listEl.innerHTML='';
-  for(const t of shown){
-    const div=document.createElement('div');
-    div.className='type-item';
-    div.textContent=t.name;
-    div.dataset.id=t.id;
-    div.addEventListener('click',()=>{
-      document.querySelectorAll('.type-item.active').forEach(el=>el.classList.remove('active'));
-      div.classList.add('active');
-      selectType(t.id,t.name);
-    });
-    listEl.appendChild(div);
-  }
-}
-
-document.getElementById('type-list-close').addEventListener('click',()=>{
-  document.getElementById('tree-list-wrap').style.display='none';
+/* ── Type list ── */
+$('tl-back').addEventListener('click', () => {
+  $('tlv').classList.remove('on');
+  $('tv').classList.add('on');
 });
 
-// ============================================================
-// Search
-// ============================================================
-let searchTimer=null;
-document.getElementById('search-input').addEventListener('input',e=>{
-  clearTimeout(searchTimer);
-  searchTimer=setTimeout(()=>{
-    const q=e.target.value.toLowerCase().trim();
-    filterTree(q);
-    if(currentGroupTypes.length) renderTypeList(currentGroupTypes,q);
-  },200);
-});
+async function openGroup(gid, gname) {
+  $('tv').classList.remove('on');
+  $('tlv').classList.add('on');
+  $('tl-name').textContent = gname;
+  const body = $('tl-body');
+  body.innerHTML = '<div class="msg"><span class="sp"></span>Loading\u2026</div>';
+  try {
+    const types = await fetch('/api/types/' + gid).then(r => r.json());
+    types.sort((a, b) => a.name.localeCompare(b.name));
+    if (!types.length) { body.innerHTML = '<div class="msg">No items in this group</div>'; return; }
+    body.innerHTML = '';
+    for (const t of types) {
+      const row = document.createElement('div');
+      row.className = 'trow';
+      if (t.id === S.tid) row.classList.add('sel');
+      row.textContent = t.name;
+      row.addEventListener('click', () => {
+        body.querySelectorAll('.trow').forEach(r => r.classList.remove('sel'));
+        row.classList.add('sel');
+        selectType(t.id, t.name);
+      });
+      body.appendChild(row);
+    }
+  } catch(e) { body.innerHTML = '<div class="msg">Error loading items</div>'; }
+}
 
-// ============================================================
-// Type selection
-// ============================================================
-async function selectType(typeId,typeName){
-  currentTypeId=typeId;
-  currentTypeName=typeName;
-  allOrders=[];
-  filteredSells=[];
-  filteredBuys=[];
-
-  // Show item panel
-  document.getElementById('empty-state').style.display='none';
-  document.getElementById('item-panel').style.display='flex';
-
-  // Update header
-  document.getElementById('item-name').textContent=typeName;
-  document.getElementById('item-breadcrumb').textContent='';
-  document.getElementById('item-icon').src=
-    'https://images.evetech.net/types/'+typeId+'/icon?size=64';
-  document.getElementById('item-icon').onerror=function(){this.src='';};
-  document.getElementById('item-loading').style.display='block';
-
-  // Reset stats
-  ['st-sell','st-buy','st-spread','st-svol','st-bvol','st-orders'].forEach(id=>{
-    document.getElementById(id).textContent='\u2014';
-  });
-  document.getElementById('sell-body').innerHTML=
-    '<tr><td colspan="6" class="loading"><span class="spinner"></span>Loading...</td></tr>';
-  document.getElementById('buy-body').innerHTML=
-    '<tr><td colspan="8" class="loading"><span class="spinner"></span>Loading...</td></tr>';
+/* ── Item selection ── */
+async function selectType(tid, tname) {
+  S.tid = tid; S.orders = [];
+  $('mp-empty').style.display = 'none';
+  $('mp-item').classList.add('on');
+  $('iname').textContent = tname;
+  $('ipath').textContent = '';
+  $('ii').src = 'https://images.evetech.net/types/' + tid + '/icon?size=64';
+  $('ii').onerror = function() { this.src = ''; };
+  ['st-sl','st-by','st-mg','st-sv','st-bv','st-or'].forEach(id => $(id).textContent = '\u2014');
+  $('sl-body').innerHTML = '<tr><td colspan="5" class="msg"><span class="sp"></span>Loading\u2026</td></tr>';
+  $('by-body').innerHTML = '<tr><td colspan="7" class="msg"><span class="sp"></span>Loading\u2026</td></tr>';
+  $('sl-meta').textContent = ''; $('by-meta').textContent = '';
   clearChart();
 
-  try{
-    const orders=await fetch('/api/orders/'+typeId).then(r=>r.json());
-    if(currentTypeId!==typeId)return; // stale
-    allOrders=orders;
-    computeAndShowStats(orders);
-    applyFiltersAndRender();
-    // Load history for selected region or all
-    const regionSel=document.getElementById('hist-region').value;
-    await loadHistory(typeId,regionSel);
-  }catch(err){
-    document.getElementById('sell-body').innerHTML=
-      '<tr><td colspan="6" class="no-data">Error: '+err.message+'</td></tr>';
-    document.getElementById('buy-body').innerHTML=
-      '<tr><td colspan="8" class="no-data">Error: '+err.message+'</td></tr>';
-  }finally{
-    document.getElementById('item-loading').style.display='none';
-  }
-}
+  try {
+    const [orders] = await Promise.all([
+      fetch('/api/orders/' + tid).then(r => r.json()),
+      loadHistory(tid),
+    ]);
+    if (S.tid !== tid) return;
+    S.orders = orders;
 
-// ============================================================
-// Stats
-// ============================================================
-function pct(arr,p){
-  if(!arr.length)return 0;
-  const sorted=[...arr].sort((a,b)=>a-b);
-  const idx=Math.max(0,Math.ceil(sorted.length*p)-1);
-  return sorted[idx];
-}
-function computeAndShowStats(orders){
-  const sells=orders.filter(o=>!o.is_buy_order);
-  const buys=orders.filter(o=>o.is_buy_order);
-  const sellPrices=sells.map(o=>o.price);
-  const buyPrices=buys.map(o=>o.price);
-  const sell5=pct(sellPrices,0.05);
-  const buy95=pct(buyPrices,0.95);
-  const spread=sell5&&buy95?((sell5-buy95)/sell5*100):null;
-  const svol=sells.reduce((a,o)=>a+o.volume_remain,0);
-  const bvol=buys.reduce((a,o)=>a+o.volume_remain,0);
-  document.getElementById('st-sell').textContent=fmtISK(sell5);
-  document.getElementById('st-buy').textContent=fmtISK(buy95);
-  document.getElementById('st-spread').textContent=
-    spread!=null?spread.toFixed(2)+'%':'\u2014';
-  document.getElementById('st-svol').textContent=fmtNum(svol);
-  document.getElementById('st-bvol').textContent=fmtNum(bvol);
-  document.getElementById('st-orders').textContent=
-    fmtNum(sells.length)+' sell / '+fmtNum(buys.length)+' buy';
-}
-
-// ============================================================
-// Filters
-// ============================================================
-function applyFiltersAndRender(){
-  const regionVal=document.getElementById('f-region').value;
-  const stationRx=document.getElementById('f-station').value.trim();
-  const maxPrice=parseFloat(document.getElementById('f-maxprice').value)||null;
-  const minQty=parseInt(document.getElementById('f-minqty').value)||null;
-
-  let stRx=null;
-  try{if(stationRx)stRx=new RegExp(stationRx,'i');}catch(e){}
-
-  function pass(o){
-    if(regionVal&&String(o.region_id)!==regionVal)return false;
-    if(stRx){
-      const nm=nameCache[o.location_id]||String(o.location_id);
-      if(!stRx.test(nm))return false;
+    /* batch-resolve ALL location names before first render */
+    const locIds = [...new Set(orders.map(o => o.location_id).filter(Boolean))];
+    const unknown = locIds.filter(id => !(id in S.names));
+    if (unknown.length) {
+      try {
+        const nr = await fetch('/api/names?ids=' + unknown.join(','));
+        if (nr.ok) Object.assign(S.names, await nr.json());
+      } catch(e) {}
     }
-    if(maxPrice!=null&&o.price>maxPrice)return false;
-    if(minQty!=null&&o.volume_remain<minQty)return false;
-    return true;
+    if (S.tid !== tid) return;
+
+    computeStats();
+    renderTables();
+  } catch(err) {
+    $('sl-body').innerHTML = '<tr><td colspan="5" class="msg">Error: '+esc(err.message)+'</td></tr>';
+    $('by-body').innerHTML = '<tr><td colspan="7" class="msg">Error: '+esc(err.message)+'</td></tr>';
   }
-
-  filteredSells=allOrders.filter(o=>!o.is_buy_order&&pass(o));
-  filteredBuys=allOrders.filter(o=>o.is_buy_order&&pass(o));
-
-  // Resolve location names if not cached
-  const locationIds=[...new Set(allOrders.map(o=>o.location_id).filter(Boolean))];
-  const unknown=locationIds.filter(id=>!(id in nameCache));
-  if(unknown.length){
-    unknown.forEach(id=>nameQueue.add(id));
-    if(nameResolveTimer)clearTimeout(nameResolveTimer);
-    nameResolveTimer=setTimeout(flushNameQueue,200);
-  }
-
-  renderSellTable();
-  renderBuyTable();
 }
 
-['f-region','f-station','f-maxprice','f-minqty'].forEach(id=>{
-  const el=document.getElementById(id);
-  el.addEventListener('change',()=>{if(allOrders.length)applyFiltersAndRender();});
-  el.addEventListener('input',()=>{if(allOrders.length)applyFiltersAndRender();});
-});
+/* ── Stats bar ── */
+function computeStats() {
+  const rid = regionId();
+  const ord = rid ? S.orders.filter(o => o.region_id === rid) : S.orders;
+  const sp  = ord.filter(o => !o.is_buy_order).map(o => o.price).sort((a,b) => a-b);
+  const bp  = ord.filter(o =>  o.is_buy_order).map(o => o.price).sort((a,b) => a-b);
+  const bs  = pct(sp, 0.05), bb = pct(bp, 0.95);
+  const mg  = bs && bb && bs > bb ? ((bs - bb) / bs * 100) : null;
+  const sv  = ord.filter(o => !o.is_buy_order).reduce((s,o) => s + o.volume_remain, 0);
+  const bv  = ord.filter(o =>  o.is_buy_order).reduce((s,o) => s + o.volume_remain, 0);
+  $('st-sl').textContent = bs ? fmtISK(bs) : '\u2014';
+  $('st-by').textContent = bb ? fmtISK(bb) : '\u2014';
+  $('st-mg').textContent = mg != null ? mg.toFixed(1)+'%' : '\u2014';
+  $('st-sv').textContent = fmtN(sv);
+  $('st-bv').textContent = fmtN(bv);
+  $('st-or').textContent = sp.length + ' / ' + bp.length;
+}
 
-// ============================================================
-// Sorting
-// ============================================================
-function sortOrders(orders,col,dir){
-  return [...orders].sort((a,b)=>{
-    let va=a[col],vb=b[col];
-    if(col==='region_name'){va=a.region_name||'';vb=b.region_name||'';}
-    if(col==='location_id'){
-      va=nameCache[a.location_id]||String(a.location_id);
-      vb=nameCache[b.location_id]||String(b.location_id);
+/* ── Tables ── */
+function renderTables() {
+  const rid = regionId();
+  let sl = S.orders.filter(o => !o.is_buy_order);
+  let by = S.orders.filter(o =>  o.is_buy_order);
+  if (rid) { sl = sl.filter(o => o.region_id === rid); by = by.filter(o => o.region_id === rid); }
+  sl = srt(sl, S.sort.s); by = srt(by, S.sort.b);
+  $('sl-meta').textContent = sl.length + ' orders';
+  $('by-meta').textContent = by.length + ' orders';
+  renderBody('sl-body', sl, false, 5);
+  renderBody('by-body', by, true,  7);
+  updateSortUI('s'); updateSortUI('b');
+}
+
+function srt(arr, st) {
+  const {c, d} = st;
+  return [...arr].sort((a, b) => {
+    let va, vb;
+    if (c === 'loc') {
+      va = S.names[a.location_id] || String(a.location_id);
+      vb = S.names[b.location_id] || String(b.location_id);
+    } else if (c === 'sec') {
+      va = a.security_status ?? -1; vb = b.security_status ?? -1;
+    } else if (c === 'exp') {
+      va = a.issued ? new Date(a.issued).getTime() + (a.duration||0)*86400000 : 0;
+      vb = b.issued ? new Date(b.issued).getTime() + (b.duration||0)*86400000 : 0;
+    } else {
+      va = a[c] ?? 0; vb = b[c] ?? 0;
     }
-    if(va==null)va=dir==='asc'?Infinity:'';
-    if(vb==null)vb=dir==='asc'?Infinity:'';
-    if(typeof va==='string')return dir==='asc'?va.localeCompare(vb):vb.localeCompare(va);
-    return dir==='asc'?va-vb:vb-va;
+    if (typeof va === 'string') return d === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
+    return d === 'asc' ? va - vb : vb - va;
   });
 }
 
-document.querySelectorAll('thead th[data-col]').forEach(th=>{
-  th.addEventListener('click',()=>{
-    const col=th.dataset.col;
-    const tbl=th.dataset.tbl;
-    const st=sortState[tbl];
-    if(st.col===col){st.dir=st.dir==='asc'?'desc':'asc';}
-    else{st.col=col;st.dir=tbl==='sell'?'asc':'desc';}
-    updateSortHeaders(tbl);
-    if(tbl==='sell')renderSellTable();
-    else renderBuyTable();
+function renderBody(bodyId, rows, isBuy, cols) {
+  const body = $(bodyId);
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="'+cols+'" class="msg">No orders.</td></tr>'; return;
+  }
+  body.innerHTML = rows.slice(0, 800).map(o => {
+    const ln  = esc(S.names[o.location_id] || String(o.location_id));
+    const rn  = esc(o.region_name || '');
+    const sc  = secCls(o.security_status);
+    const sv  = fmtSec(o.security_status);
+    const ex  = fmtExp(o.issued, o.duration);
+    const lc  = '<td><span class="loc">'+ln+'</span> <span class="rgn">'+rn+'</span></td>';
+    if (isBuy) return '<tr>'+
+      '<td class="pb">'+fmtISK(o.price)+'</td>'+
+      '<td>'+fmtN(o.volume_remain)+'</td>'+
+      '<td>'+esc(o.range||'')+'</td>'+
+      '<td>'+fmtN(o.min_volume)+'</td>'+
+      lc+
+      '<td class="'+sc+'">'+sv+'</td>'+
+      '<td>'+ex+'</td></tr>';
+    return '<tr>'+
+      '<td class="ps">'+fmtISK(o.price)+'</td>'+
+      '<td>'+fmtN(o.volume_remain)+'</td>'+
+      lc+
+      '<td class="'+sc+'">'+sv+'</td>'+
+      '<td>'+ex+'</td></tr>';
+  }).join('');
+  if (rows.length > 800) {
+    body.innerHTML += '<tr><td colspan="'+cols+'" class="msg">Showing 800 of '+rows.length+' orders</td></tr>';
+  }
+}
+
+/* Sort header clicks */
+document.querySelectorAll('thead th[data-c]').forEach(th => {
+  th.addEventListener('click', () => {
+    const c = th.dataset.c, t = th.dataset.t;
+    const st = S.sort[t];
+    if (st.c === c) st.d = st.d === 'asc' ? 'desc' : 'asc';
+    else { st.c = c; st.d = (c==='price' && t==='s') ? 'asc' : (c==='price' && t==='b') ? 'desc' : 'asc'; }
+    renderTables();
   });
 });
 
-function updateSortHeaders(tbl){
-  const st=sortState[tbl];
-  document.querySelectorAll('thead th[data-tbl="'+tbl+'"]').forEach(th=>{
+function updateSortUI(t) {
+  const st  = S.sort[t];
+  const hdr = $(t === 's' ? 'sl-hdr' : 'by-hdr');
+  hdr.querySelectorAll('th').forEach(th => {
     th.classList.remove('asc','desc');
-    if(th.dataset.col===st.col)th.classList.add(st.dir);
+    if (th.dataset.c === st.c) th.classList.add(st.d);
   });
 }
 
-// ============================================================
-// Sell table
-// ============================================================
-function renderSellTable(){
-  const st=sortState.sell;
-  const rows=sortOrders(filteredSells,st.col,st.dir);
-  const tbody=document.getElementById('sell-body');
-  document.getElementById('sell-count').textContent=rows.length+' orders';
-  if(!rows.length){
-    tbody.innerHTML='<tr><td colspan="6" class="no-data">No sell orders match the current filters.</td></tr>';
-    return;
-  }
-  tbody.innerHTML=rows.slice(0,500).map(o=>{
-    const loc=nameCache[o.location_id]||o.location_id;
-    const sec=o.security_status;
-    const cls=secColor(sec);
-    const exp=expiresDate(o.issued,o.duration);
-    return '<tr>'+
-      '<td class="price-sell">'+fmtISK(o.price)+'</td>'+
-      '<td>'+fmtNum(o.volume_remain)+'</td>'+
-      '<td>'+(o.region_name||'')+'</td>'+
-      '<td title="'+o.location_id+'">'+htmlEsc(String(loc))+'</td>'+
-      '<td class="'+cls+'">'+fmtSec(sec)+'</td>'+
-      '<td>'+htmlEsc(exp)+'</td>'+
-      '</tr>';
-  }).join('');
-  if(rows.length>500){
-    tbody.innerHTML+='<tr><td colspan="6" class="no-data">... and '+(rows.length-500)+' more (showing top 500)</td></tr>';
-  }
+/* ── History chart ── */
+function clearChart() {
+  if (S.chart) { try { S.chart.destroy(); } catch(e) {} S.chart = null; }
+  $('ch-el').innerHTML = '<div class="msg">No history data available.</div>';
+  $('ch-meta').textContent = '';
 }
 
-// ============================================================
-// Buy table
-// ============================================================
-function renderBuyTable(){
-  const st=sortState.buy;
-  const rows=sortOrders(filteredBuys,st.col,st.dir);
-  const tbody=document.getElementById('buy-body');
-  document.getElementById('buy-count').textContent=rows.length+' orders';
-  if(!rows.length){
-    tbody.innerHTML='<tr><td colspan="8" class="no-data">No buy orders match the current filters.</td></tr>';
-    return;
-  }
-  tbody.innerHTML=rows.slice(0,500).map(o=>{
-    const loc=nameCache[o.location_id]||o.location_id;
-    const sec=o.security_status;
-    const cls=secColor(sec);
-    const exp=expiresDate(o.issued,o.duration);
-    return '<tr>'+
-      '<td class="price-buy">'+fmtISK(o.price)+'</td>'+
-      '<td>'+fmtNum(o.volume_remain)+'</td>'+
-      '<td>'+(o.range||'')+'</td>'+
-      '<td>'+fmtNum(o.min_volume)+'</td>'+
-      '<td>'+(o.region_name||'')+'</td>'+
-      '<td title="'+o.location_id+'">'+htmlEsc(String(loc))+'</td>'+
-      '<td class="'+cls+'">'+fmtSec(sec)+'</td>'+
-      '<td>'+htmlEsc(exp)+'</td>'+
-      '</tr>';
-  }).join('');
-  if(rows.length>500){
-    tbody.innerHTML+='<tr><td colspan="8" class="no-data">... and '+(rows.length-500)+' more (showing top 500)</td></tr>';
-  }
-}
-
-function htmlEsc(s){
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-// ============================================================
-// History chart
-// ============================================================
-async function loadHistory(typeId, regionVal){
+async function loadHistory(tid) {
+  const rid = regionId();
+  const url = '/api/esi_history/' + tid + '/' + (rid || 'all');
   clearChart();
-  document.getElementById('chart-empty').textContent='Loading history...';
-  document.getElementById('chart-empty').style.display='block';
-
-  const histStation=document.getElementById('hist-station').value.trim();
-  let url;
-  if(histStation){
-    // Station filter: use "all" history and filter client-side by station name regex
-    // (We use region "all" and note station regex is cosmetic for now — ESI history is per region)
-    url='/api/esi_history/'+typeId+'/all';
-  } else if(regionVal==='all'||!regionVal){
-    url='/api/esi_history/'+typeId+'/all';
-  } else {
-    url='/api/esi_history/'+typeId+'/'+regionVal;
-  }
-
-  try{
-    const data=await fetch(url).then(r=>r.json());
-    if(currentTypeId!==typeId)return;
-    const rows=data.rows||[];
-    if(!rows.length){
-      document.getElementById('chart-empty').textContent='No history data cached for this item/region.';
+  try {
+    const data = await fetch(url).then(r => r.json());
+    if (S.tid !== tid) return;
+    const rows = (data.rows || [])
+      .filter(r => r.date && r.average != null)
+      .sort((a,b) => a.date.localeCompare(b.date));
+    if (!rows.length) {
+      $('ch-el').innerHTML = '<div class="msg">No cached history for this item/region yet.</div>';
       return;
     }
-    document.getElementById('chart-empty').style.display='none';
-    renderChart(rows);
-  }catch(e){
-    document.getElementById('chart-empty').textContent='Failed to load history: '+e.message;
+    $('ch-meta').textContent = rows.length + ' days';
+    drawChart(rows);
+  } catch(e) {
+    $('ch-el').innerHTML = '<div class="msg">History unavailable.</div>';
   }
 }
 
-function clearChart(){
-  if(chartInst){try{chartInst.destroy();}catch(e){}chartInst=null;}
-  const wrap=document.getElementById('chart-wrap');
-  const old=wrap.querySelector('.u-wrap');
-  if(old)old.remove();
-  document.getElementById('chart-empty').style.display='block';
-}
-
-function renderChart(rows){
-  rows=rows.filter(r=>r.date&&r.average!=null).sort((a,b)=>a.date.localeCompare(b.date));
-  if(!rows.length)return;
-
-  const ts=rows.map(r=>new Date(r.date+'T00:00:00Z').getTime()/1000);
-  const avg=rows.map(r=>r.average||null);
-  const high=rows.map(r=>r.highest||null);
-  const low=rows.map(r=>r.lowest||null);
-  const vol=rows.map(r=>r.volume||0);
-
-  const wrap=document.getElementById('chart-wrap');
-  const W=wrap.clientWidth||800;
-
-  // Muted EVE colours
-  const COLORS={avg:'#4a90d9',high:'#d09030',low:'#7a8aaa',vol:'rgba(74,144,217,0.15)'};
-  const TICK_COLOR='#3a4060';
-  const LABEL_COLOR='#7a8aaa';
-  const GRID_COLOR='rgba(58,64,96,0.6)';
-
-  const opts={
-    width:W,height:240,
-    padding:[10,10,0,0],
-    cursor:{show:true,sync:{key:'mkt'}},
-    legend:{show:true,live:true},
-    scales:{
-      x:{time:true},
-      isk:{auto:true,distr:1},
-      vol:{auto:true,distr:1},
-    },
-    axes:[
-      {
-        stroke:LABEL_COLOR,
-        ticks:{stroke:TICK_COLOR,width:1},
-        grid:{stroke:GRID_COLOR,width:1},
-      },
-      {
-        scale:'isk',
-        stroke:LABEL_COLOR,
-        ticks:{stroke:TICK_COLOR,width:1},
-        grid:{stroke:GRID_COLOR,width:1},
-        values:(u,vals)=>vals.map(v=>v==null?'':fmt(v)),
-        size:80,
-      },
-      {
-        scale:'vol',
-        side:1,
-        stroke:LABEL_COLOR,
-        ticks:{stroke:TICK_COLOR,width:1},
-        grid:{stroke:GRID_COLOR,width:1},
-        values:(u,vals)=>vals.map(v=>v==null?'':fmt(v,0)),
-        size:60,
-      },
+function drawChart(rows) {
+  const el = $('ch-el'); el.innerHTML = '';
+  const W  = Math.max(300, el.clientWidth - 16);
+  const xs = rows.map(r => new Date(r.date + 'T00:00:00Z').getTime() / 1000);
+  const hi = rows.map(r => r.highest || null);
+  const av = rows.map(r => r.average  || null);
+  const lo = rows.map(r => r.lowest   || null);
+  const vo = rows.map(r => r.volume   || 0);
+  const AX = '#354060', GR = 'rgba(40,50,80,0.7)';
+  const opts = {
+    width: W, height: 210,
+    padding: [6, 10, 0, 0],
+    legend: { show: false },
+    cursor: { show: true },
+    scales: { x: { time: true }, isk: {}, vol: {} },
+    axes: [
+      { stroke: AX, ticks: {stroke:AX}, grid: {stroke:GR}, font: '11px sans-serif' },
+      { scale:'isk', stroke:AX, ticks:{stroke:AX}, grid:{stroke:GR}, font:'11px sans-serif',
+        size: 70, values: (u,vs) => vs.map(v => v==null?'':fmtISK(v)) },
+      { scale:'vol', side:1, stroke:AX, ticks:{stroke:AX}, grid:{stroke:GR},
+        font:'11px sans-serif', size:55, values: (u,vs) => vs.map(v => v==null?'':fmtN(v)) },
     ],
-    series:[
+    series: [
       {},
-      {
-        label:'High',scale:'isk',
-        stroke:COLORS.high,width:1,
-        paths:uPlot.paths.linear(),
-        points:{show:false},
-      },
-      {
-        label:'Avg',scale:'isk',
-        stroke:COLORS.avg,width:2,
-        paths:uPlot.paths.linear(),
-        points:{show:false},
-      },
-      {
-        label:'Low',scale:'isk',
-        stroke:COLORS.low,width:1,
-        paths:uPlot.paths.linear(),
-        points:{show:false},
-      },
-      {
-        label:'Volume',scale:'vol',
-        stroke:'rgba(74,144,217,0.7)',
-        fill:'rgba(74,144,217,0.12)',
-        width:1,
-        paths:uPlot.paths.bars({size:[0.7,Infinity]}),
-        points:{show:false},
-      },
+      { label:'High', scale:'isk', stroke:'#506838', width:1,
+        paths: uPlot.paths.linear(), points:{show:false} },
+      { label:'Avg',  scale:'isk', stroke:'#3e7cb5', width:2,
+        paths: uPlot.paths.linear(), points:{show:false} },
+      { label:'Low',  scale:'isk', stroke:'#705090', width:1,
+        paths: uPlot.paths.linear(), points:{show:false} },
+      { label:'Vol',  scale:'vol', stroke:'rgba(62,124,181,0.5)', fill:'rgba(62,124,181,0.1)',
+        width:1, paths: uPlot.paths.bars({size:[0.6,20]}), points:{show:false} },
     ],
   };
-
-  try{
-    chartInst=new uPlot(opts,[ts,high,avg,low,vol],wrap);
-    // Apply dark background
-    wrap.querySelector('.u-wrap').style.background='transparent';
-  }catch(e){
-    document.getElementById('chart-empty').textContent='Chart error: '+e.message;
-    document.getElementById('chart-empty').style.display='block';
-  }
+  try { S.chart = new uPlot(opts, [xs, hi, av, lo, vo], el); }
+  catch(e) { el.innerHTML = '<div class="msg">Chart error: '+esc(e.message)+'</div>'; }
 }
-
-// History controls
-document.getElementById('hist-region').addEventListener('change',e=>{
-  if(currentTypeId)loadHistory(currentTypeId,e.target.value);
-});
-let histStationTimer=null;
-document.getElementById('hist-station').addEventListener('input',()=>{
-  clearTimeout(histStationTimer);
-  histStationTimer=setTimeout(()=>{
-    if(currentTypeId)loadHistory(currentTypeId,document.getElementById('hist-region').value);
-  },600);
-});
-
-// ============================================================
-// Init
-// ============================================================
-async function init(){
-  try{
-    const [groups,regions]=await Promise.all([
-      fetch('/api/market_groups').then(r=>r.json()),
-      fetch('/api/regions').then(r=>r.json()),
-    ]);
-    allRegions=regions;
-
-    // Populate region dropdowns
-    const histSel=document.getElementById('hist-region');
-    const fSel=document.getElementById('f-region');
-    for(const r of regions){
-      const o1=document.createElement('option');
-      o1.value=String(r.id);o1.textContent=r.name;
-      histSel.appendChild(o1);
-      const o2=document.createElement('option');
-      o2.value=String(r.id);o2.textContent=r.name;
-      fSel.appendChild(o2);
-    }
-
-    renderTree(groups);
-  }catch(e){
-    document.getElementById('tree-container').innerHTML=
-      '<div class="no-data">Failed to load market data: '+e.message+'</div>';
-  }
-}
-
-init();
 </script>
 </body>
-</html>""".encode("utf-8")
+</html>"""
+
+
+def make_browser_html(tree: list, regions: list) -> bytes:
+    """Return the browser page with SDE data embedded as JS constants."""
+    return (
+        _TMPL
+        .replace("/*TREE*/", json.dumps(tree, separators=(",", ":")))
+        .replace("/*REGIONS*/", json.dumps(regions, separators=(",", ":")))
+        .encode("utf-8")
+    )
