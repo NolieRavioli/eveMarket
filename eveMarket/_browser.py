@@ -1,6 +1,6 @@
 """Browser UI HTML — served at GET /browser."""
 
-BROWSER_HTML: bytes = b"""<!DOCTYPE html>
+BROWSER_HTML: bytes = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -914,4 +914,4 @@ async function init(){
 init();
 </script>
 </body>
-</html>"""
+</html>""".encode("utf-8")
