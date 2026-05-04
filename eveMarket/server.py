@@ -628,6 +628,21 @@ def _make_handler(state: MarketState):
                     data = _sdm.regions_list(state.sde_dir)
                     return self._send_json(200, data)
 
+                if sub == "search_types" and len(parts) == 2:
+                    q = qs.get("q", [""])[0].strip().lower()
+                    if len(q) < 2:
+                        return self._send_json(200, [])
+                    cache = _sdm.get_cache(state.sde_dir)
+                    groups = cache["groups"]
+                    results = []
+                    for tid, t in cache["types"].items():
+                        if q in t["name"].lower():
+                            gid = t["group"]
+                            gname = groups.get(gid, {}).get("name", "") if gid else ""
+                            results.append({"id": t["id"], "name": t["name"], "groupName": gname})
+                    results.sort(key=lambda x: (x["name"].lower().find(q), x["name"].lower()))
+                    return self._send_json(200, results[:100])
+
                 if sub == "orders" and len(parts) == 3:
                     tid = self._parse_int(parts[2])
                     if tid is None:
