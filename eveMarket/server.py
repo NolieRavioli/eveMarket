@@ -54,6 +54,7 @@ from .stats import (
     latest_snapshot_path,
     parse_range,
 )
+from ._browser import BROWSER_HTML as _BROWSER_HTML
 
 logger = logging.getLogger(__name__)
 
@@ -602,6 +603,132 @@ def _make_handler(state: MarketState):
                     rows,
                     extra_headers={"X-Contracts-Snapshot-Unix": snap},
                 )
+
+            # ----- browser UI -----
+            if head == "browser" and len(parts) == 1:
+                return self._send_html(_BROWSER_HTML)
+
+            # ----- browser JSON API -----
+            if head == "api" and len(parts) >= 2:
+                from . import sde_market as _sdm
+                sub = parts[1]
+
+                if sub == "market_groups" and len(parts) == 2:
+                    data = _sdm.market_group_tree(state.sde_dir)
+                    return self._send_json(200, data)
+
+                if sub == "types" and len(parts) == 3:
+                    gid = self._parse_int(parts[2])
+                    if gid is None:
+                        return self._send_json(400, {"error": "invalid group_id"})
+                    data = _sdm.types_in_group(state.sde_dir, gid)
+                    return self._send_json(200, data)
+
+                if sub == "regions" and len(parts) == 2:
+                    data = _sdm.regions_list(state.sde_dir)
+                    return self._send_json(200, data)
+
+                if sub == "orders" and len(parts) == 3:
+                    tid = self._parse_int(parts[2])
+                    if tid is None:
+                        return self._send_json(400, {"error": "invalid type_id"})
+                    latest = latest_snapshot(state.data_dir)
+                    if latest is None:
+                        return self._send_json(503, {"error": "no snapshots yet"})
+                    snap_path = orders_path(state.data_dir, latest)
+                    cache = _sdm.get_cache(state.sde_dir)
+                    sec_map = cache["system_security"]
+                    rgn_map = cache["region_names"]
+                    out = []
+                    for o in iter_snapshot(snap_path):
+                        if o.get("type_id") != tid:
+                            continue
+                        sys_id = o.get("system_id")
+                        rgn_id = o.get("region_id")
+                        o["security_status"] = round(sec_map.get(sys_id, 0.0), 1) if sys_id else None
+                        o["region_name"] = rgn_map.get(rgn_id, str(rgn_id)) if rgn_id else None
+                        out.append(o)
+                    return self._send_json(200, out)
+
+                if sub == "esi_history" and len(parts) in (3, 4):
+                    tid = self._parse_int(parts[2])
+                    if tid is None:
+                        return self._send_json(400, {"error": "invalid type_id"})
+                    from .history import load_history as _load_hist
+                    # all regions or a specific region
+                    if len(parts) == 3 or parts[3] == "all":
+                        # aggregate daily history across all cached region files
+                        from .snapshot import history_dir as _hist_dir
+                        import os as _os
+                        hdir = _hist_dir(state.data_dir)
+                        agg: dict[str, dict] = {}  # date -> {volume, total_avg, count}
+                        for fname in _os.listdir(hdir):
+                            if not fname.startswith("region-") or not fname.endswith(".json"):
+                                continue
+                            try:
+                                rid2 = int(fname[len("region-"):-len(".json")])
+                            except ValueError:
+                                continue
+                            hist = _load_hist(state.data_dir, rid2) or {}
+                            type_data = hist.get("types", {}).get(str(tid), {})
+                            for row in type_data.get("rows", []):
+                                d = row.get("date")
+                                if not d:
+                                    continue
+                                vol = row.get("volume", 0) or 0
+                                avg = row.get("average", 0) or 0
+                                high = row.get("highest", 0) or 0
+                                low = row.get("lowest", 0) or 0
+                                if d not in agg:
+                                    agg[d] = {"volume": 0, "wsum": 0.0,
+                                               "highest": 0.0, "lowest": float("inf")}
+                                agg[d]["volume"] += vol
+                                agg[d]["wsum"] += avg * vol
+                                agg[d]["highest"] = max(agg[d]["highest"], high)
+                                if low:
+                                    agg[d]["lowest"] = min(agg[d]["lowest"], low)
+                        rows_out = []
+                        for d, v in sorted(agg.items()):
+                            vol = v["volume"]
+                            avg = (v["wsum"] / vol) if vol else 0.0
+                            low = v["lowest"] if v["lowest"] != float("inf") else 0.0
+                            rows_out.append({
+                                "date": d,
+                                "average": avg,
+                                "highest": v["highest"],
+                                "lowest": low,
+                                "volume": vol,
+                            })
+                        return self._send_json(200, {"rows": rows_out})
+                    else:
+                        rid = self._parse_int(parts[3])
+                        if rid is None:
+                            return self._send_json(400, {"error": "invalid region_id"})
+                        hist = _load_hist(state.data_dir, rid) or {}
+                        type_data = hist.get("types", {}).get(str(tid), {})
+                        return self._send_json(200, {"rows": type_data.get("rows", [])})
+
+                if sub == "names" and len(parts) == 2:
+                    ids_raw = qs.get("ids", [""])[0]
+                    try:
+                        ids_list = [int(x) for x in ids_raw.split(",") if x.strip()]
+                    except ValueError:
+                        return self._send_json(400, {"error": "invalid ids"})
+                    if not ids_list:
+                        return self._send_json(200, {})
+                    import requests as _req
+                    try:
+                        resp = _req.post(
+                            "https://esi.evetech.net/latest/universe/names/",
+                            json=ids_list,
+                            headers={"User-Agent": "eveMarket/1.0"},
+                            timeout=10,
+                        )
+                        resp.raise_for_status()
+                        names = {item["id"]: item["name"] for item in resp.json()}
+                        return self._send_json(200, names)
+                    except Exception as exc:
+                        return self._send_json(502, {"error": str(exc)})
 
             return self._send_json(404, {"error": "not found", "path": self.path})
 
