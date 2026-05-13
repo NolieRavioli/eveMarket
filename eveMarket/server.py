@@ -55,6 +55,7 @@ from .stats import (
     parse_range,
 )
 from ._browser import make_browser_html as _make_browser_html
+from ._appraisal import APPRAISAL_HTML, appraise, resolve_location_names
 
 logger = logging.getLogger(__name__)
 
@@ -613,6 +614,10 @@ def _make_handler(state: MarketState):
                 )
                 return self._send_html(html)
 
+            # ----- appraisal-maxxer UI -----
+            if head == "appraisal-maxxer" and len(parts) == 1:
+                return self._send_html(APPRAISAL_HTML)
+
             # ----- browser JSON API -----
             if head == "api" and len(parts) >= 2:
                 from . import sde_market as _sdm
@@ -839,6 +844,41 @@ def _make_handler(state: MarketState):
                     return self._send_json(503, {"error": "no snapshots yet"})
                 payload = compute_live_stats(snap_path, info, type_ids)
                 return self._send_json(200, payload)
+
+            if head == "appraisal-maxxer" and len(parts) == 1:
+                body = self._read_body()
+                if body is None:
+                    return
+                if not isinstance(body, dict):
+                    return self._send_json(400, {"error": "body must be a JSON object"})
+                text = body.get("items") or ""
+                if not isinstance(text, str):
+                    return self._send_json(400, {"error": "items must be a string"})
+                try:
+                    num_orders = int(body.get("num_orders") or 1)
+                except (TypeError, ValueError):
+                    return self._send_json(400, {"error": "invalid num_orders"})
+                try:
+                    top_n = int(body.get("top_n") or 10)
+                except (TypeError, ValueError):
+                    return self._send_json(400, {"error": "invalid top_n"})
+                top_n = max(1, min(top_n, 50))
+                mode = str(body.get("mode") or "buy").lower()
+                if mode not in ("buy", "sell"):
+                    return self._send_json(400, {"error": "mode must be 'buy' or 'sell'"})
+
+                result = appraise(
+                    state.sde_dir, state.data_dir, state.resolver,
+                    text, num_orders, mode, top_n=top_n,
+                )
+                if "results" in result and result["results"]:
+                    name_map = resolve_location_names(
+                        r["location_id"] for r in result["results"]
+                    )
+                    for r in result["results"]:
+                        r["location_name"] = name_map.get(r["location_id"])
+                code = 400 if result.get("error") else 200
+                return self._send_json(code, result)
 
             if head == "history" and len(parts) == 3:
                 lid = self._parse_int(parts[1])
