@@ -91,19 +91,36 @@ def parse_paste(text: str) -> tuple[list[tuple[str, int]], list[str]]:
         if low.startswith("total") or low.startswith("estimated"):
             continue
 
-        # Tab-delimited (EVE in-game paste): Name\tQty\t...
+        # Tab-delimited (EVE in-game paste). Columns vary; we look for one
+        # numeric column (qty) and take the first non-empty non-numeric
+        # column as the name. Handles both "Name\tQty\t..." and
+        # "\tQty\tName" layouts.
         if "\t" in line:
-            cols = [c.strip() for c in line.split("\t") if c.strip()]
-            name = cols[0] if cols else ""
+            cols = [c.strip() for c in line.split("\t")]
             qty: Optional[int] = None
-            for c in cols[1:]:
-                cs = c.replace(",", "").replace(".", "")
+            qty_idx: Optional[int] = None
+            for i, c in enumerate(cols):
+                if not c:
+                    continue
+                cs = c.replace(",", "")
+                # Integer-only (don't accidentally consume a decimal price).
                 if cs.isdigit():
                     try:
                         qty = int(cs)
+                        qty_idx = i
                         break
                     except ValueError:
                         pass
+            name = ""
+            if qty_idx is not None:
+                for i, c in enumerate(cols):
+                    if i == qty_idx or not c or c == "-":
+                        continue
+                    cs = c.replace(",", "")
+                    if cs.isdigit():
+                        continue
+                    name = c
+                    break
             if not name or qty is None or qty <= 0:
                 errors.append(f"could not parse: {raw!r}")
                 continue
