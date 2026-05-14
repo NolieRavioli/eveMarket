@@ -149,6 +149,27 @@ def parse_paste(text: str) -> tuple[list[tuple[str, int]], list[str]]:
     return items, errors
 
 
+_STRIP_SUFFIXES = (
+    " raw resource",
+    " tier 1", " tier 2", " tier 3", " tier 4",
+    " p1", " p2", " p3", " p4",
+)
+
+
+def _lookup_name(idx: dict[str, int], name: str) -> Optional[int]:
+    key = name.strip().lower()
+    tid = idx.get(key)
+    if tid is not None:
+        return tid
+    for suf in _STRIP_SUFFIXES:
+        if key.endswith(suf):
+            stripped = key[:-len(suf)].strip()
+            tid = idx.get(stripped)
+            if tid is not None:
+                return tid
+    return None
+
+
 def resolve_names(sde_dir: Path, items: list[tuple[str, int]]
                   ) -> tuple[dict[int, int], list[str]]:
     """Map names → type_ids and merge quantities. Returns (req, unknown_names)."""
@@ -156,7 +177,7 @@ def resolve_names(sde_dir: Path, items: list[tuple[str, int]]
     req: dict[int, int] = {}
     unknown: list[str] = []
     for name, qty in items:
-        tid = idx.get(name.strip().lower())
+        tid = _lookup_name(idx, name)
         if tid is None:
             unknown.append(name)
             continue
