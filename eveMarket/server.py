@@ -56,6 +56,7 @@ from .stats import (
 )
 from ._browser import make_browser_html as _make_browser_html
 from ._appraisal import APPRAISAL_HTML, appraise, resolve_location_names
+from ._skillbook import SKILLBOOK_HTML, skillbook_maxx
 
 logger = logging.getLogger(__name__)
 
@@ -618,6 +619,10 @@ def _make_handler(state: MarketState):
             if head == "appraisal-maxxer" and len(parts) == 1:
                 return self._send_html(APPRAISAL_HTML)
 
+            # ----- skillbook-maxxer UI -----
+            if head == "skillbook-maxxer" and len(parts) == 1:
+                return self._send_html(SKILLBOOK_HTML)
+
             # ----- browser JSON API -----
             if head == "api" and len(parts) >= 2:
                 from . import sde_market as _sdm
@@ -876,7 +881,27 @@ def _make_handler(state: MarketState):
                         r["location_id"] for r in result["results"]
                     )
                     for r in result["results"]:
-                        r["location_name"] = name_map.get(r["location_id"])
+                        skillbook-maxxer" and len(parts) == 1:
+                body = self._read_body()
+                if body is None:
+                    return
+                if not isinstance(body, dict):
+                    return self._send_json(400, {"error": "body must be a JSON object"})
+                text = body.get("items") or ""
+                if not isinstance(text, str):
+                    return self._send_json(400, {"error": "items must be a string"})
+                hub = str(body.get("hub") or "jita").lower()
+                try:
+                    markup = float(body.get("markup") or 1.2)
+                except (TypeError, ValueError):
+                    return self._send_json(400, {"error": "invalid markup"})
+                result = skillbook_maxx(
+                    state.sde_dir, state.data_dir, text, hub, markup=markup,
+                )
+                code = 400 if result.get("error") else 200
+                return self._send_json(code, result)
+
+            if head == "r["location_name"] = name_map.get(r["location_id"])
                 code = 400 if result.get("error") else 200
                 return self._send_json(code, result)
 
