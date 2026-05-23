@@ -299,7 +299,7 @@ def skillbook_maxx(sde_dir: Path, data_dir: Path,
 # ---------------------------------------------------------------------------
 # HTML page -- served by GET /skillbook-maxxer
 # ---------------------------------------------------------------------------
-SKILLBOOK_HTML = b"""<!DOCTYPE html>
+SKILLBOOK_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -527,4 +527,4 @@ function render(d){
 $('btn-run').addEventListener('click', run);
 </script>
 </body>
-</html>"""
+</html>""".encode("utf-8")
