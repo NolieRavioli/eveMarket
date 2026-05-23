@@ -881,7 +881,11 @@ def _make_handler(state: MarketState):
                         r["location_id"] for r in result["results"]
                     )
                     for r in result["results"]:
-                        skillbook-maxxer" and len(parts) == 1:
+                        r["location_name"] = name_map.get(r["location_id"])
+                code = 400 if result.get("error") else 200
+                return self._send_json(code, result)
+
+            if head == "skillbook-maxxer" and len(parts) == 1:
                 body = self._read_body()
                 if body is None:
                     return
@@ -898,10 +902,6 @@ def _make_handler(state: MarketState):
                 result = skillbook_maxx(
                     state.sde_dir, state.data_dir, text, hub, markup=markup,
                 )
-                code = 400 if result.get("error") else 200
-                return self._send_json(code, result)
-
-            if head == "r["location_name"] = name_map.get(r["location_id"])
                 code = 400 if result.get("error") else 200
                 return self._send_json(code, result)
 
