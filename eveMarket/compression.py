@@ -122,24 +122,38 @@ def _inferred_jsonl_path(data_dir: Path, unix: int) -> Path:
     return inferred_dir(data_dir) / f"infer-{int(unix)}.jsonl"
 
 
+def _delete_file(path: Path) -> bool:
+    """Delete path, returning True if a file was actually removed."""
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        logger.exception("failed to delete %s", path)
+        return False
+
+
 def sweep_old_data(
     data_dir: Path,
     *,
-    keep_orders: int = 2,
-    keep_inferred: int = 1,
+    keep_orders: int = 1,
+    keep_inferred: int = 0,
     keep_contracts: int = 1,
 ) -> dict[str, int]:
-    """Gzip historical order/inferred/contracts files, leaving the newest few alone.
+    """Delete old order/inferred/contracts files, keeping only the newest few.
 
-    Returns a small report dict with counts and bytes saved. Safe to call
-    repeatedly; already-compressed files are skipped.
+    Both plain .jsonl and already-gzipped .jsonl.gz variants are removed so
+    that files accumulated before this change are also cleaned up. Disk usage
+    is therefore bounded: at most keep_orders complete snapshots on disk at
+    any time.
+
+    Returns a small report dict. Safe to call repeatedly.
     """
     report = {
-        "orders_compressed": 0,
-        "inferred_compressed": 0,
-        "contracts_compressed": 0,
-        "bytes_before": 0,
-        "bytes_after": 0,
+        "orders_deleted": 0,
+        "inferred_deleted": 0,
+        "contracts_deleted": 0,
         "elapsed_s": 0,
     }
     t0 = time.monotonic()
@@ -150,24 +164,12 @@ def sweep_old_data(
         old = snaps[: len(snaps) - keep_orders]
         for unix in old:
             src = orders_path(data_dir, unix)
-            if not src.exists():
-                continue  # already gzipped
-            try:
-                size_before = src.stat().st_size
-                dst = _gzip_in_place(src)
-                size_after = dst.stat().st_size
-                report["orders_compressed"] += 1
-                report["bytes_before"] += size_before
-                report["bytes_after"] += size_after
-                logger.info(
-                    "compressed orders-%s.jsonl: %.1f MiB -> %.1f MiB (%.1fx)",
-                    unix,
-                    size_before / 1024 / 1024,
-                    size_after / 1024 / 1024,
-                    size_before / max(size_after, 1),
-                )
-            except Exception:
-                logger.exception("failed to gzip %s", src)
+            if _delete_file(src):
+                report["orders_deleted"] += 1
+                logger.info("deleted orders-%s.jsonl", unix)
+            if _delete_file(gz_sibling(src)):
+                report["orders_deleted"] += 1
+                logger.info("deleted orders-%s.jsonl.gz", unix)
 
     # --- inferred ------------------------------------------------------
     inf_unix = _list_inferred_unix(data_dir)
@@ -175,24 +177,13 @@ def sweep_old_data(
         old = inf_unix[: len(inf_unix) - keep_inferred]
         for unix in old:
             src = _inferred_jsonl_path(data_dir, unix)
-            if not src.exists():
-                continue  # already gzipped (or never written)
-            try:
-                size_before = src.stat().st_size
-                dst = _gzip_in_place(src)
-                size_after = dst.stat().st_size
-                report["inferred_compressed"] += 1
-                report["bytes_before"] += size_before
-                report["bytes_after"] += size_after
-                logger.info(
-                    "compressed infer-%s.jsonl: %.1f MiB -> %.1f MiB (%.1fx)",
-                    unix,
-                    size_before / 1024 / 1024,
-                    size_after / 1024 / 1024,
-                    size_before / max(size_after, 1),
-                )
-            except Exception:
-                logger.exception("failed to gzip %s", src)
+            if _delete_file(src):
+                report["inferred_deleted"] += 1
+                logger.info("deleted infer-%s.jsonl", unix)
+            if _delete_file(gz_sibling(src)):
+                report["inferred_deleted"] += 1
+                logger.info("deleted infer-%s.jsonl.gz", unix)
+            _delete_file(inferred_dir(data_dir) / f"infer-{int(unix)}.done")
 
     # --- contracts snapshots ----------------------------------------
     contract_unix = list_contracts_snapshots(data_dir)
@@ -200,34 +191,20 @@ def sweep_old_data(
         old = contract_unix[: len(contract_unix) - keep_contracts]
         for unix in old:
             src = contracts_path(data_dir, unix)
-            if not src.exists():
-                continue  # already gzipped
-            try:
-                size_before = src.stat().st_size
-                dst = _gzip_in_place(src)
-                size_after = dst.stat().st_size
-                report["contracts_compressed"] += 1
-                report["bytes_before"] += size_before
-                report["bytes_after"] += size_after
-                logger.info(
-                    "compressed contracts-%s.jsonl: %.1f MiB -> %.1f MiB (%.1fx)",
-                    unix,
-                    size_before / 1024 / 1024,
-                    size_after / 1024 / 1024,
-                    size_before / max(size_after, 1),
-                )
-            except Exception:
-                logger.exception("failed to gzip %s", src)
+            if _delete_file(src):
+                report["contracts_deleted"] += 1
+                logger.info("deleted contracts-%s.jsonl", unix)
+            if _delete_file(gz_sibling(src)):
+                report["contracts_deleted"] += 1
+                logger.info("deleted contracts-%s.jsonl.gz", unix)
 
     report["elapsed_s"] = round(time.monotonic() - t0, 2)
-    if report["orders_compressed"] or report["inferred_compressed"] or report["contracts_compressed"]:
-        saved = report["bytes_before"] - report["bytes_after"]
+    if report["orders_deleted"] or report["inferred_deleted"] or report["contracts_deleted"]:
         logger.info(
-            "sweep: compressed %s orders + %s inferred + %s contracts in %ss, saved %.1f MiB",
-            report["orders_compressed"],
-            report["inferred_compressed"],
-            report["contracts_compressed"],
+            "sweep: deleted %s orders + %s inferred + %s contracts in %ss",
+            report["orders_deleted"],
+            report["inferred_deleted"],
+            report["contracts_deleted"],
             report["elapsed_s"],
-            saved / 1024 / 1024,
         )
     return report

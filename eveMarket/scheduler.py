@@ -66,7 +66,7 @@ class CollectorScheduler:
         *,
         interval_s: int = 301,
         client: Optional[EsiClient] = None,
-        run_inference: bool = True,
+        run_inference: bool = False,
         on_snapshot: Optional[Callable[[Path, int, int], None]] = None,
     ) -> None:
         self.sde_dir = Path(sde_dir)
@@ -103,6 +103,7 @@ class CollectorScheduler:
                 snapshot_unix=snapshot_unix,
                 resolver=self._resolver,
                 client=self.client,
+                do_history=False,
             )
         except Exception:
             logger.exception("precompute failed for snapshot %s", snapshot_unix)
@@ -116,14 +117,6 @@ class CollectorScheduler:
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
-        # Catch up on inferred trades for any pre-existing snapshot pair before
-        # the periodic loop starts (runs in a daemon thread so we don't block).
-        if self.run_inference:
-            threading.Thread(
-                target=self.catch_up_inferred,
-                name="eveMarket-infer-catchup",
-                daemon=True,
-            ).start()
         # Catch up on precomputed datasets for the latest snapshot if stale.
         threading.Thread(
             target=self.catch_up_precompute,

@@ -83,7 +83,7 @@ def main() -> int:
         data_dir=args.data,
         interval_s=args.interval,
         client=client,
-        run_inference=not args.no_inference,
+        run_inference=False,
     )
 
     contract_scheduler: ContractScheduler | None = None
