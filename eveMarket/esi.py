@@ -65,17 +65,30 @@ class EsiClient:
             "User-Agent": user_agent,
             "Accept": "application/json",
         })
-        # Rate-limit state updated from ESI response headers. Protected by
-        # _rl_lock because CollectorScheduler and ContractScheduler share a
-        # single EsiClient and call get() from different threads.
+        # Rate-limit state — all fields protected by _rl_lock because
+        # CollectorScheduler and ContractScheduler share one EsiClient and
+        # call get() from different threads.
         self._rl_lock = threading.Lock()
+        # Per-route-group request rate limits: {group: {remaining, limit, window_s}}.
+        # Different ESI endpoint groups (e.g. "market", "contracts") have
+        # independent limits; we track each separately so the dashboard shows
+        # all groups, not just whichever responded most recently.
+        self._rl_by_group: dict = {}
+        # Flat "last-seen" fields kept for backward compatibility with any
+        # callers that read them directly (e.g. the pre-group dashboard code).
         self.rl_remaining: Optional[int] = None
         self.rl_limit: Optional[int] = None
         self.rl_window_seconds: Optional[int] = None
         self.rl_group: Optional[str] = None
+        # Global error-rate-limit (X-ESI-Error-Limit-*).  Shared across ALL
+        # ESI requests — contract-item 404s count against the same bucket as
+        # market-order fetches.  ESI returns 420 when it hits zero.
+        self.err_remain: Optional[int] = None
+        self._err_reset_at: Optional[float] = None  # absolute unix of next reset
 
     def update_from_headers(self, headers) -> None:
         with self._rl_lock:
+            # --- per-group request rate limit ---
             try:
                 rem = headers.get("X-Ratelimit-Remaining")
                 if rem is not None:
@@ -90,24 +103,54 @@ class EsiClient:
             grp = headers.get("X-Ratelimit-Group")
             if grp:
                 self.rl_group = grp
+                entry = self._rl_by_group.setdefault(grp, {})
+                if self.rl_remaining is not None:
+                    entry["remaining"] = self.rl_remaining
+                if self.rl_limit is not None:
+                    entry["limit"] = self.rl_limit
+                if self.rl_window_seconds is not None:
+                    entry["window_s"] = self.rl_window_seconds
+            # --- global error rate limit ---
+            try:
+                err_rem = headers.get("X-ESI-Error-Limit-Remain")
+                if err_rem is not None:
+                    self.err_remain = int(err_rem)
+            except (TypeError, ValueError):
+                pass
+            try:
+                err_reset = headers.get("X-ESI-Error-Limit-Reset")
+                if err_reset is not None:
+                    self._err_reset_at = time.time() + float(err_reset)
+            except (TypeError, ValueError):
+                pass
+
+    def rl_snapshot(self) -> dict:
+        """Return a thread-safe copy of all rate-limit state for the dashboard."""
+        with self._rl_lock:
+            return {
+                "by_group": {k: dict(v) for k, v in self._rl_by_group.items()},
+                "err_remain": self.err_remain,
+                "err_reset_at": self._err_reset_at,
+            }
 
     def _proactive_sleep(self) -> None:
         with self._rl_lock:
-            rem = self.rl_remaining
-            lim = self.rl_limit
-            win = self.rl_window_seconds
-        if (
-            rem is not None
-            and lim
-            and win
-            and rem <= self.low_water
-        ):
-            sleep_s = win / max(lim, 1)
-            logger.info(
-                "[ESI] floating window low (%s/%s) - sleeping %.2fs",
-                rem, lim, sleep_s,
-            )
-            time.sleep(sleep_s)
+            groups = dict(self._rl_by_group)
+            err_remain = self.err_remain
+        sleep_needed = 0.0
+        for grp, state in groups.items():
+            rem = state.get("remaining")
+            lim = state.get("limit")
+            win = state.get("window_s")
+            if rem is not None and lim and win and rem <= self.low_water:
+                s = win / max(lim, 1)
+                logger.info("[ESI] %s group low (%s/%s) — sleeping %.2fs", grp, rem, lim, s)
+                sleep_needed = max(sleep_needed, s)
+        if err_remain is not None and err_remain <= self.low_water:
+            logger.info("[ESI] error budget low (%s) — backing off 2s", err_remain)
+            sleep_needed = max(sleep_needed, 2.0)
+        if sleep_needed > 0:
+            time.sleep(sleep_needed)
 
     def get(
         self,

@@ -213,6 +213,7 @@ def collect_snapshot(
     trigger_unix: Optional[int] = None,
     client: Optional[EsiClient] = None,
     stop_event: Optional[threading.Event] = None,
+    status=None,
 ) -> tuple[Path, int, int, Optional[float]]:
     """Refresh per-region order-book cache and emit an aggregate snapshot.
 
@@ -264,6 +265,10 @@ def collect_snapshot(
             f"(refreshed={refreshed} 304={not_modified} fail={failed})",
             client=client,
         )
+        if status is not None:
+            elapsed_a = time.monotonic() - t0
+            eta_a = elapsed_a / idx * (n_regions - idx) if idx > 0 else None
+            status.update(phase="page-1 sweep", done=idx, total=n_regions, eta_s=eta_a)
         try:
             resp = client.get(url, params=params, headers=headers)
         except Exception as exc:
@@ -320,6 +325,8 @@ def collect_snapshot(
     pages_total_b = sum(max(0, p - 1) for p in pages_per_region.values())
     pages_done_b = 0
     t_b = time.monotonic()
+    if status is not None:
+        status.update(phase="pages 2…N", done=0, total=pages_total_b, eta_s=None)
     for region_id, total_pages in pages_per_region.items():
         if total_pages <= 1:
             continue
@@ -335,7 +342,10 @@ def collect_snapshot(
                 eta_m, eta_s2 = divmod(int(eta_s), 60)
                 eta_str = f"{eta_m}m {eta_s2:02d}s"
             else:
+                eta_s = None
                 eta_str = "--"
+            if status is not None:
+                status.update(phase="pages 2…N", done=pages_done_b, total=pages_total_b, eta_s=eta_s)
             _rprint(
                 f"[orders pages] {pages_done_b}/{pages_total_b} "
                 f"region={region_id} ETA {eta_str}",

@@ -17,7 +17,7 @@ from typing import Callable, List, Optional
 
 from .collector import collect_snapshot
 from .compression import sweep_old_data
-from .contracts import collect_contracts
+from .contracts import ContractItemsQueue, collect_contract_items, collect_contracts
 from .esi import EsiClient
 from .inferred import diff_snapshots, is_complete, write_inferred
 from .location import LocationResolver
@@ -38,6 +38,49 @@ _ESI_PING_URL = "https://esi.evetech.net/ping"
 
 # Interval between ESI ping attempts during downtime (seconds).
 _DOWNTIME_POLL_INTERVAL = 120
+
+
+class CollectionStatus:
+    """Thread-safe, live status for one collection pass.
+
+    The scheduler calls ``start()`` before a collection and ``finish()`` after.
+    The collection function calls ``update()`` throughout to report phase,
+    progress, and ETA.  The dashboard reads ``snapshot()`` at any time.
+    """
+
+    __slots__ = ("_lock", "_d")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._d: dict = {
+            "active": False,
+            "phase": "",
+            "done": 0,
+            "total": 0,
+            "eta_s": None,
+            "started_at": None,
+            "next_at": None,
+        }
+
+    def start(self, phase: str = "") -> None:
+        with self._lock:
+            self._d.update(
+                active=True, phase=phase,
+                done=0, total=0, eta_s=None,
+                started_at=time.time(),
+            )
+
+    def update(self, **kwargs) -> None:
+        with self._lock:
+            self._d.update(kwargs)
+
+    def finish(self) -> None:
+        with self._lock:
+            self._d.update(active=False, phase="", done=0, total=0, eta_s=None)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._d)
 
 
 class _CancelToken:
@@ -78,6 +121,7 @@ class CollectorScheduler:
         self.stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._running = threading.Lock()
+        self.orders_status = CollectionStatus()
         # Downtime support: _downtime is SET while ESI is suspended; _cancel
         # is a momentary pulse used by DowntimeGuard to abort an in-flight
         # collection without triggering a full scheduler shutdown.
@@ -201,12 +245,8 @@ class CollectorScheduler:
             now = time.time()
             if now >= next_at:
                 collected_at = self._run_one()
-                # Base the next tick on the ESI Last-Modified timestamp
-                # (returned by collect_snapshot) so we fire exactly
-                # interval_s after ESI's cache epoch, not interval_s after
-                # we finished the crawl. Falls back to time.time() if the
-                # collection failed or returned no Last-Modified headers.
                 next_at = (collected_at or time.time()) + self.interval_s
+                self.orders_status.update(next_at=next_at)
             self.stop_event.wait(min(5.0, max(0.5, next_at - time.time())))
 
     def _run_one(self) -> Optional[float]:
@@ -224,6 +264,7 @@ class CollectorScheduler:
         if not self._running.acquire(blocking=False):
             logger.warning("scheduler: previous collection still running, skipping tick")
             return None
+        self.orders_status.start("page-1 sweep")
         try:
             trigger_unix = int(time.time())
             prev_unix = previous_snapshot(self.data_dir, trigger_unix)
@@ -233,6 +274,7 @@ class CollectorScheduler:
                     trigger_unix=trigger_unix,
                     client=self.client,
                     stop_event=_CancelToken(self.stop_event, self._cancel),
+                    status=self.orders_status,
                 )
             except InterruptedError:
                 logger.info("scheduler: collection interrupted")
@@ -241,6 +283,7 @@ class CollectorScheduler:
                 logger.exception("scheduler: collection failed")
                 return None
         finally:
+            self.orders_status.finish()
             self._running.release()
 
         if self.on_snapshot is not None:
@@ -303,7 +346,7 @@ class CollectorScheduler:
 # ESI's public-contracts cache window is ~10 minutes; 30 minutes is well
 # above that and keeps load on the upstream low while still presenting a
 # fresh-enough view to clients.
-CONTRACTS_INTERVAL_DEFAULT_S = 1800
+CONTRACTS_INTERVAL_DEFAULT_S = 1801
 
 
 class ContractScheduler:
@@ -333,6 +376,10 @@ class ContractScheduler:
         self.stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._running = threading.Lock()
+        self._items_running = threading.Lock()
+        self._items_queue = ContractItemsQueue(data_dir)
+        self.headers_status = CollectionStatus()
+        self.items_status = CollectionStatus()
         # Downtime support (see DowntimeGuard).
         self._downtime = threading.Event()
         self._cancel = threading.Event()
@@ -411,6 +458,7 @@ class ContractScheduler:
                 esi_lm = self._run_one()
                 next_at = (esi_lm or time.time()) + self.interval_s
                 self._save_next_run(next_at)
+                self.headers_status.update(next_at=next_at)
             self.stop_event.wait(min(15.0, max(0.5, next_at - time.time())))
 
     def _run_one(self) -> Optional[float]:
@@ -418,27 +466,69 @@ class ContractScheduler:
         if not self._running.acquire(blocking=False):
             logger.warning("contracts scheduler: previous run still in flight, skipping tick")
             return None
+        self.headers_status.start("page-1 sweep")
         try:
             esi_lm_unix: Optional[float] = None
+            snapshot_path = None
             try:
-                _, _, _, esi_lm_unix = collect_contracts(
+                snapshot_path, _, _, esi_lm_unix = collect_contracts(
                     self.sde_dir, self.data_dir,
                     trigger_unix=int(time.time()),
                     client=self.client,
                     stop_event=_CancelToken(self.stop_event, self._cancel),
+                    status=self.headers_status,
                 )
             except InterruptedError:
                 logger.info("contracts scheduler: collection interrupted")
             except Exception:
                 logger.exception("contracts scheduler: collection failed")
+            finally:
+                self.headers_status.finish()
             # Compress old contract snapshots so they don't accumulate on disk.
             try:
                 sweep_old_data(self.data_dir)
             except Exception:
                 logger.exception("contracts scheduler: compression sweep failed")
+            if snapshot_path is not None:
+                added, removed = self._items_queue.sync_snapshot(snapshot_path)
+                logger.info(
+                    "contract items queue: +%d -%d (pending=%d)",
+                    added, removed, len(self._items_queue),
+                )
+                if len(self._items_queue) > 0:
+                    threading.Thread(
+                        target=self._fetch_items,
+                        name="eveMarket-contracts-items",
+                        daemon=True,
+                    ).start()
             return esi_lm_unix
         finally:
             self._running.release()
+
+    def _fetch_items(self) -> None:
+        """Drain the items queue (background thread).
+
+        Only one thread runs at a time; if this is called while one is already
+        running, the call returns immediately — the live queue update from
+        ``sync_snapshot`` ensures the running thread will see any new IDs.
+        """
+        if not self._items_running.acquire(blocking=False):
+            return
+        self.items_status.start("items")
+        try:
+            collect_contract_items(
+                self.data_dir, self._items_queue,
+                client=self.client,
+                stop_event=_CancelToken(self.stop_event, self._cancel),
+                status=self.items_status,
+            )
+        except InterruptedError:
+            logger.info("contracts items: interrupted")
+        except Exception:
+            logger.exception("contracts items: fetch failed")
+        finally:
+            self.items_status.finish()
+            self._items_running.release()
 
 
 # ---------------------------------------------------------------------------

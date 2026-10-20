@@ -18,17 +18,26 @@ Responses are gzip-encoded when the client sends ``Accept-Encoding: gzip``
 """
 from __future__ import annotations
 
+import collections
 import gzip
+import html
 import json
 import logging
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from .esi import EsiClient
-from .contracts import iter_courier_contracts
+from .scheduler import CollectionStatus
+from .contracts import (
+    contract_items_stats,
+    iter_auction_contracts,
+    iter_courier_contracts,
+    iter_item_exchange_contracts,
+)
 from .index import filter_snapshot, iter_snapshot, matches
 from .inferred import diff_snapshots, load_inferred
 from .location import LocationResolver
@@ -61,344 +70,408 @@ from ._skillbook import SKILLBOOK_HTML, skillbook_maxx
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Root HTML page — served by GET /
+# Shared CSS + HTML page builders
 # ---------------------------------------------------------------------------
-_ROOT_HTML = b"""<!DOCTYPE html>
+
+_CSS = """\
+:root{--bg:#0d1117;--bg2:#161b22;--border:#30363d;--text:#c9d1d9;--accent:#58a6ff;\
+--green:#3fb950;--orange:#d29922;--red:#f85149;--head:#e6edf3;--code-bg:#1f2428}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;\
+background:var(--bg);color:var(--text);margin:0;padding:1.5rem 2rem;line-height:1.6;max-width:1100px}
+h1{color:var(--head);font-size:1.8rem;border-bottom:1px solid var(--border);padding-bottom:.4rem;margin-bottom:.75rem}
+h2{color:var(--head);font-size:1.1rem;border-bottom:1px solid var(--border);padding-bottom:.25rem;margin-top:1.8rem}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+code{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;\
+background:var(--code-bg);border-radius:4px;padding:.15em .4em;font-size:.875em}
+pre{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;\
+padding:.75em 1em;overflow-x:auto;font-size:.85rem;white-space:pre-wrap}
+table{border-collapse:collapse;width:100%;margin:.6em 0;font-size:.9rem}
+th,td{border:1px solid var(--border);padding:.4em .7em;text-align:left}
+th{background:var(--bg2);color:var(--head)}
+.get{color:var(--green);font-weight:700}.post{color:var(--orange);font-weight:700}
+.tools{display:flex;gap:.5rem;flex-wrap:wrap;margin:.6rem 0 1.5rem}
+.tools a{background:var(--bg2);border:1px solid var(--border);border-radius:5px;\
+padding:.3rem .75rem;font-size:.9rem;color:var(--accent)}
+.tools a:hover{border-color:var(--accent);text-decoration:none}
+.cards{display:flex;flex-wrap:wrap;gap:.65rem;margin:.5rem 0 1rem}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:6px;\
+padding:.65rem 1rem;min-width:160px;flex:1}
+.card h3{margin:0 0 .3rem;color:var(--head);font-size:.9rem;font-weight:600}
+.card .val{font-size:1.45rem;font-weight:700;color:var(--accent);line-height:1.2}
+.card .sub{font-size:.77rem;color:#8b949e;margin-top:.2rem}
+.log-table{width:100%;border-collapse:collapse;font-size:.78rem;font-family:monospace}
+.log-table td{padding:.12em .4em;border-bottom:1px solid #21262d;vertical-align:top;word-break:break-all}
+.log-INFO{color:var(--text)}.log-WARNING{color:var(--orange)}.log-ERROR,.log-CRITICAL{color:var(--red)}.log-DEBUG{color:#6e7681}
+"""
+
+
+class _RingHandler(logging.Handler):
+    """In-memory ring buffer of the last N log records for the dashboard."""
+
+    def __init__(self, maxlen: int = 300) -> None:
+        super().__init__()
+        self._buf: collections.deque = collections.deque(maxlen=maxlen)
+        self.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._buf.append((record.levelno, self.format(record)))
+        except Exception:
+            self.handleError(record)
+
+    def get_records(self) -> list:
+        return list(self._buf)
+
+
+# ---------------------------------------------------------------------------
+# HTML page builders
+# ---------------------------------------------------------------------------
+
+def _ago(now_s: float, ts: Optional[float]) -> str:
+    if ts is None:
+        return "never"
+    diff = int(now_s - ts)
+    if diff < 0:
+        return "just now"
+    if diff < 60:
+        return f"{diff}s ago"
+    if diff < 3600:
+        return f"{diff // 60}m {diff % 60:02d}s ago"
+    h, m = divmod(diff // 60, 60)
+    return f"{h}h {m:02d}m ago"
+
+
+def _fmt_ts(ts: Optional[float]) -> str:
+    if ts is None:
+        return "&mdash;"
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts))
+
+
+def _fmt_eta(eta_s: Optional[float]) -> str:
+    if eta_s is None or eta_s < 0:
+        return ""
+    s = int(eta_s)
+    m, s2 = divmod(s, 60)
+    h, m2 = divmod(m, 60)
+    if h:
+        return f"{h}h {m2:02d}m"
+    if m2:
+        return f"{m2}m {s2:02d}s"
+    return f"{s2}s"
+
+
+def _render_status(st: dict, now: float) -> str:
+    """Return an HTML status line for a CollectionStatus snapshot dict."""
+    if not st.get("active"):
+        next_at = st.get("next_at")
+        if next_at and next_at > now:
+            wait = _fmt_eta(next_at - now)
+            return (
+                f'<span style="color:#8b949e">○ idle</span>'
+                f' &mdash; next run in <b>{wait}</b>'
+            )
+        return '<span style="color:#8b949e">○ idle</span>'
+
+    parts = ['<span style="color:var(--green)">● COLLECTING</span>']
+    phase = st.get("phase") or ""
+    if phase:
+        parts.append(f'<b>{html.escape(phase)}</b>')
+    done = st.get("done", 0)
+    total = st.get("total", 0)
+    if total:
+        pct = int(100 * done / total)
+        parts.append(f'{done:,}/{total:,} ({pct}%)')
+    eta_str = _fmt_eta(st.get("eta_s"))
+    if eta_str:
+        parts.append(f'ETA <b>{eta_str}</b>')
+    started_at = st.get("started_at")
+    if started_at:
+        parts.append(f'running {_fmt_eta(now - started_at)}')
+    return " &middot; ".join(parts)
+
+
+def _build_root_html(state: "MarketState") -> bytes:
+    run_inf = state.run_inference
+    run_con = state.run_contracts
+
+    inf_rows = ""
+    if run_inf:
+        inf_rows = """\
+<tr><td><span class="get">GET</span></td><td><code>/inferred/{location_id}</code></td>\
+<td>Inferred trades at a location from the latest snapshot pair</td></tr>
+<tr><td><span class="get">GET</span></td><td><code>/history/{range}</code></td>\
+<td>Universe-wide precomputed history &mdash; <code>7d</code>, <code>14d</code>, <code>30d</code></td></tr>
+<tr><td><span class="post">POST</span></td><td><code>/history/{location_id}/{range}</code></td>\
+<td>Inferred-trade history for a JSON array of type IDs</td></tr>"""
+
+    con_rows = ""
+    if run_con:
+        con_rows = """\
+<tr><td><span class="get">GET</span></td><td><code>/contracts/courier</code></td>\
+<td>Active courier contracts universe-wide (NDJSON)</td></tr>
+<tr><td><span class="get">GET</span></td><td><code>/contracts/sell</code></td>\
+<td>Active item-exchange sell contracts &mdash; WTS (NDJSON)</td></tr>
+<tr><td><span class="get">GET</span></td><td><code>/contracts/buy</code></td>\
+<td>Active item-exchange buy contracts &mdash; WTB, <code>reward&gt;0</code> (NDJSON)</td></tr>
+<tr><td><span class="get">GET</span></td><td><code>/contracts/auction</code></td>\
+<td>Active auction contracts (NDJSON)</td></tr>"""
+
+    body = f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>eveMarket API</title>
-<style>
-:root{--bg:#0d1117;--bg2:#161b22;--border:#30363d;--text:#c9d1d9;--accent:#58a6ff;--green:#3fb950;--orange:#d29922;--head:#e6edf3;--code-bg:#1f2428}
-*{box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:1.5rem 2.5rem;line-height:1.6;max-width:980px}
-h1{color:var(--head);font-size:1.9rem;border-bottom:1px solid var(--border);padding-bottom:.5rem}
-h2{color:var(--head);font-size:1.25rem;border-bottom:1px solid var(--border);padding-bottom:.3rem;margin-top:2.5rem}
-h3{color:var(--head);font-size:1rem;margin-top:1.8rem}
-a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
-code{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;background:var(--code-bg);border-radius:4px;padding:.15em .4em;font-size:.875em}
-pre{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;padding:1em;overflow-x:auto;font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;font-size:.875rem;white-space:pre-wrap}
-pre code{background:none;padding:0;font-size:inherit}
-table{border-collapse:collapse;width:100%;margin:.8em 0;font-size:.9rem}
-th,td{border:1px solid var(--border);padding:.45em .75em;text-align:left}
-th{background:var(--bg2);color:var(--head)}
-.get{color:var(--green);font-weight:700}.post{color:var(--orange);font-weight:700}
-hr{border:none;border-top:1px solid var(--border);margin:2.5rem 0}
-ul{padding-left:1.4em}li{margin:.2em 0}
-.toc{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:1rem 1.5rem;display:inline-block;margin-bottom:1.5rem;min-width:300px}
-.toc ul{margin:.2em 0}
-</style>
+<style>{_CSS}</style>
 </head>
 <body>
 <h1>eveMarket API</h1>
-<p>Market snapshot collector and HTTP API server for EVE Online market data. Default bind: <code>0.0.0.0:13307</code></p>
+<p>Market-data collector and HTTP API for EVE Online. &nbsp;<a href="/dash">Dashboard &rarr;</a></p>
 
-<div class="toc"><strong>Contents</strong>
-<ul>
-<li><a href="#start">Start</a></li>
-<li><a href="#formats">Response Formats</a></li>
-<li><a href="#locations">Location IDs</a></li>
-<li><a href="#endpoints">Endpoints</a>
-  <ul>
-  <li><a href="#ep-health"><span class="get">GET</span> /health</a></li>
-  <li><a href="#ep-currentorders"><span class="get">GET</span> /currentOrders/{location_id}</a></li>
-  <li><a href="#ep-orders"><span class="get">GET</span> /orders</a></li>
-  <li><a href="#ep-orders-unix"><span class="get">GET</span> /orders/{unix_time}</a></li>
-  <li><a href="#ep-inferred"><span class="get">GET</span> /inferred/{location_id}</a></li>
-  <li><a href="#ep-history-range"><span class="get">GET</span> /history/{range}</a></li>
-  <li><a href="#ep-contracts-courier"><span class="get">GET</span> /contracts/courier</a></li>
-  <li><a href="#ep-stats"><span class="post">POST</span> /stats/{location_id}</a></li>
-  <li><a href="#ep-history-post"><span class="post">POST</span> /history/{location_id}/{range}</a></li>
-  </ul>
-</li>
-<li><a href="#data">Data Layout</a></li>
-</ul>
+<div class="tools">
+<a href="/browser">Market Browser</a>
+<a href="/appraisal-maxxer">Appraisal Maxxer</a>
+<a href="/skillbook-maxxer">Skillbook Maxxer</a>
+<a href="/dash">Dashboard</a>
 </div>
 
-<h2 id="start">Start</h2>
-<pre><code>pip install -r requirements.txt
-python eveMarket.py</code></pre>
+<h2>Endpoints</h2>
 <table>
-<tr><th>Flag</th><th>Default</th><th>Description</th></tr>
-<tr><td><code>--bind</code></td><td><code>0.0.0.0</code></td><td>HTTP bind address</td></tr>
-<tr><td><code>--port</code></td><td><code>13307</code></td><td>HTTP port</td></tr>
-<tr><td><code>--data</code></td><td><code>./data</code></td><td>Data directory</td></tr>
-<tr><td><code>--sde</code></td><td><code>./sde</code></td><td>SDE directory (auto-downloaded if missing)</td></tr>
-<tr><td><code>--interval</code></td><td><code>1200</code></td><td>Collection interval in seconds (20&thinsp;min)</td></tr>
-<tr><td><code>--no-inference</code></td><td></td><td>Disable inferred-trade processing</td></tr>
-<tr><td><code>--log-level</code></td><td><code>INFO</code></td><td>Python logging level</td></tr>
+<tr><th>Method</th><th>Path</th><th>Description</th></tr>
+<tr><td><span class="get">GET</span></td><td><code>/health</code></td>\
+<td>Service health, snapshot count and latest timestamp</td></tr>
+<tr><td><span class="get">GET</span></td><td><code>/orders</code></td>\
+<td>Latest full market snapshot (NDJSON, gzip)</td></tr>
+<tr><td><span class="get">GET</span></td><td><code>/orders/{{unix}}</code></td>\
+<td>Snapshot nearest to unix timestamp &mdash; optional <code>?location=</code> filter</td></tr>
+<tr><td><span class="get">GET</span></td><td><code>/currentOrders/{{location_id}}</code></td>\
+<td>Live orders at a region, constellation, system, or station</td></tr>
+<tr><td><span class="post">POST</span></td><td><code>/stats/{{location_id}}</code></td>\
+<td>Order-book statistics for a JSON array of type IDs</td></tr>
+{inf_rows}
+{con_rows}
 </table>
 
-<h2 id="formats">Response Formats</h2>
+<h2>Location IDs</h2>
 <table>
-<tr><th>Format</th><th>Content-Type</th><th>When used</th></tr>
-<tr><td>JSON</td><td><code>application/json</code></td><td>All single-object responses</td></tr>
-<tr><td>NDJSON</td><td><code>application/x-ndjson</code></td><td>Streaming order/trade/history/contract endpoints</td></tr>
-</table>
-<p>NDJSON: one JSON object per line. <strong>All NDJSON endpoints are gzip-encoded unconditionally</strong> (<code>Content-Encoding: gzip</code>, &sim;12&times; smaller on the wire). Standard clients (<code>requests</code>, <code>curl --compressed</code>, browsers, <code>wget</code>) decode transparently. Bare <code>curl</code> callers should pipe through <code>gunzip</code>. Body is close-delimited (no chunked encoding); read the stream until EOF.</p>
-
-<h2 id="locations">Location IDs</h2>
-<p>All <code>{location_id}</code> path parameters accept:</p>
-<table>
-<tr><th>Kind</th><th>ID range</th><th>Example</th></tr>
-<tr><td>Region</td><td>10&thinsp;000&thinsp;000 &ndash; 10&thinsp;999&thinsp;999</td><td><code>10000002</code> (The Forge)</td></tr>
-<tr><td>Constellation</td><td>20&thinsp;000&thinsp;000 &ndash; 20&thinsp;999&thinsp;999</td><td><code>20000020</code> (Kimotoro)</td></tr>
-<tr><td>Solar system</td><td>30&thinsp;000&thinsp;000 &ndash; 30&thinsp;999&thinsp;999</td><td><code>30000142</code> (Jita)</td></tr>
-<tr><td>NPC station</td><td>60&thinsp;000&thinsp;000 &ndash; 63&thinsp;999&thinsp;999</td><td><code>60003760</code> (Jita&nbsp;4-4)</td></tr>
-<tr><td>Player structure</td><td>&ge;&thinsp;1&thinsp;000&thinsp;000&thinsp;000&thinsp;000</td><td><code>1035466617946</code></td></tr>
+<tr><th>Kind</th><th>Range</th><th>Example</th></tr>
+<tr><td>Region</td><td>10&thinsp;000&thinsp;000&ndash;10&thinsp;999&thinsp;999</td>\
+<td><code>10000002</code> (The Forge)</td></tr>
+<tr><td>Constellation</td><td>20&thinsp;000&thinsp;000&ndash;20&thinsp;999&thinsp;999</td>\
+<td><code>20000020</code> (Kimotoro)</td></tr>
+<tr><td>Solar system</td><td>30&thinsp;000&thinsp;000&ndash;30&thinsp;999&thinsp;999</td>\
+<td><code>30000142</code> (Jita)</td></tr>
+<tr><td>NPC station</td><td>60&thinsp;000&thinsp;000&ndash;63&thinsp;999&thinsp;999</td>\
+<td><code>60003760</code> (Jita 4-4)</td></tr>
+<tr><td>Player structure</td><td>&ge;&thinsp;1&thinsp;000&thinsp;000&thinsp;000&thinsp;000</td>\
+<td><code>1035466617946</code></td></tr>
 </table>
 
-<h2 id="endpoints">Endpoints</h2>
-<hr>
-<h3 id="ep-health"><span class="get">GET</span> /health</h3>
-<p>Server health and snapshot count.</p>
-<pre><code>GET /health</code></pre>
-<p><strong>Response</strong> <code>200 application/json</code></p>
-<pre><code>{"ok": true, "snapshots": 18, "latest_unix": 1777272798}</code></pre>
-<table>
-<tr><th>Field</th><th>Type</th><th>Description</th></tr>
-<tr><td><code>ok</code></td><td>bool</td><td>Always <code>true</code></td></tr>
-<tr><td><code>snapshots</code></td><td>int</td><td>Number of snapshots on disk</td></tr>
-<tr><td><code>latest_unix</code></td><td>int|null</td><td>Unix timestamp of the latest snapshot</td></tr>
-</table>
-<hr>
-
-<h3 id="ep-currentorders"><span class="get">GET</span> /currentOrders/{location_id}</h3>
-<p>Current live orders from the latest snapshot, filtered to the given location.</p>
-<pre><code>GET /currentOrders/10000002
-GET /currentOrders/60003760</code></pre>
-<p><strong>Response</strong> <code>200 application/x-ndjson</code> &mdash; stream of order objects:</p>
-<pre><code>{"order_id":7315521535,"type_id":3452,"region_id":10000001,"system_id":30000087,
- "location_id":60012142,"is_buy_order":false,"price":1010.0,"volume_remain":1,
- "volume_total":1,"min_volume":1,"range":"region","duration":7,
- "issued":"2026-04-22T14:35:48Z"}</code></pre>
-<table>
-<tr><th>Field</th><th>Type</th><th>Description</th></tr>
-<tr><td><code>order_id</code></td><td>int</td><td>ESI order ID</td></tr>
-<tr><td><code>type_id</code></td><td>int</td><td>Item type</td></tr>
-<tr><td><code>region_id</code></td><td>int</td><td>Region the order was collected from</td></tr>
-<tr><td><code>system_id</code></td><td>int</td><td>Solar system of the order</td></tr>
-<tr><td><code>location_id</code></td><td>int</td><td>Station or structure ID</td></tr>
-<tr><td><code>is_buy_order</code></td><td>bool</td><td><code>true</code> = buy order</td></tr>
-<tr><td><code>price</code></td><td>float</td><td>ISK per unit</td></tr>
-<tr><td><code>volume_remain</code></td><td>int</td><td>Units remaining</td></tr>
-<tr><td><code>volume_total</code></td><td>int</td><td>Original quantity</td></tr>
-<tr><td><code>min_volume</code></td><td>int</td><td>Minimum fill size</td></tr>
-<tr><td><code>range</code></td><td>string</td><td>Buy-order fill range: <code>"station"</code>, <code>"solarsystem"</code>, <code>"constellation"</code>, <code>"region"</code>, or <code>"1"</code>&ndash;<code>"40"</code> jumps. Always <code>"region"</code> for sell orders.</td></tr>
-<tr><td><code>duration</code></td><td>int</td><td>Order lifetime in days</td></tr>
-<tr><td><code>issued</code></td><td>string</td><td>ISO&nbsp;8601 UTC timestamp of issuance</td></tr>
-</table>
-<p><strong>Errors</strong></p>
-<table>
-<tr><th>Code</th><th>Reason</th></tr>
-<tr><td><code>400</code></td><td>Invalid <code>location_id</code></td></tr>
-<tr><td><code>404</code></td><td>Unknown location</td></tr>
-<tr><td><code>503</code></td><td>No snapshots yet</td></tr>
-</table>
-<hr>
-
-<h3 id="ep-orders"><span class="get">GET</span> /orders</h3>
-<p>Entire latest snapshot as a flat NDJSON stream &mdash; every region, every order.</p>
-<pre><code>GET /orders</code></pre>
-<p><strong>Response</strong> <code>200 application/x-ndjson</code></p>
-<p>Response header <code>X-Snapshot-Unix</code> carries the snapshot unix timestamp. Each row has the same fields as <a href="#ep-currentorders">GET /currentOrders</a>.</p>
-<p><strong>Errors</strong></p>
-<table>
-<tr><th>Code</th><th>Reason</th></tr>
-<tr><td><code>503</code></td><td>No snapshots yet</td></tr>
-</table>
-<hr>
-
-<h3 id="ep-orders-unix"><span class="get">GET</span> /orders/{unix_time}</h3>
-<p>Orders from the snapshot <strong>nearest</strong> to <code>unix_time</code> (any direction).</p>
-<pre><code>GET /orders/1777247000
-GET /orders/1777247000?location=30000142</code></pre>
-<table>
-<tr><th>Param</th><th>Description</th></tr>
-<tr><td><code>location</code></td><td>Optional &mdash; filter by any location ID</td></tr>
-</table>
-<p><strong>Response</strong> <code>200 application/x-ndjson</code></p>
-<p>Response header <code>X-Snapshot-Unix</code> carries the timestamp of the snapshot actually used. Each row has the same fields as <a href="#ep-currentorders">GET /currentOrders</a>.</p>
-<p><strong>Errors</strong></p>
-<table>
-<tr><th>Code</th><th>Reason</th></tr>
-<tr><td><code>400</code></td><td>Invalid <code>unix_time</code> or invalid <code>location</code> param</td></tr>
-<tr><td><code>404</code></td><td>Unknown location</td></tr>
-<tr><td><code>503</code></td><td>No snapshots yet</td></tr>
-</table>
-<hr>
-
-<h3 id="ep-inferred"><span class="get">GET</span> /inferred/{location_id}</h3>
-<p>Inferred trades derived from the latest snapshot pair, filtered to the given location. Reads from the precomputed inferred cache when available; falls back to live computation otherwise.</p>
-<pre><code>GET /inferred/10000002
-GET /inferred/60003760</code></pre>
-<p><strong>Response</strong> <code>200 application/x-ndjson</code> &mdash; stream of inferred-trade objects:</p>
-<pre><code>{"actual":true,"order_id":7319060832,"type_id":13249,"region_id":10000002,
- "system_id":30000142,"is_buy_order":false,"price":18900000.0,"volume":1.0,
- "location_id":60003760,"buyer_range":null,"buyer_station_id":null}</code></pre>
-<table>
-<tr><th>Field</th><th>Type</th><th>Description</th></tr>
-<tr><td><code>actual</code></td><td>bool</td><td><code>true</code> = fill observed as volume delta; <code>false</code> = inferred from order disappearance</td></tr>
-<tr><td><code>order_id</code></td><td>int</td><td>ESI order ID of the filled order</td></tr>
-<tr><td><code>type_id</code></td><td>int</td><td>Item type</td></tr>
-<tr><td><code>region_id</code></td><td>int</td><td>Region</td></tr>
-<tr><td><code>system_id</code></td><td>int|null</td><td>Solar system (null for some older records)</td></tr>
-<tr><td><code>is_buy_order</code></td><td>bool</td><td>Whether the filled order was a buy</td></tr>
-<tr><td><code>price</code></td><td>float</td><td>ISK per unit at time of fill</td></tr>
-<tr><td><code>volume</code></td><td>float</td><td>Estimated units traded</td></tr>
-<tr><td><code>location_id</code></td><td>int|null</td><td>Concrete fill station, or <code>null</code> for non-station-range buys where the exact fill destination is unknown</td></tr>
-<tr><td><code>buyer_range</code></td><td>string|null</td><td>ESI range of the buy order (<code>"station"</code>, <code>"solarsystem"</code>, <code>"constellation"</code>, <code>"region"</code>, or jump count as string). <code>null</code> for sell-side fills.</td></tr>
-<tr><td><code>buyer_station_id</code></td><td>int|null</td><td>Station ID of the buyer&rsquo;s order. <code>null</code> for sell-side fills.</td></tr>
-</table>
-<p>Response header <code>X-Snapshot-Unix</code> carries the unix timestamp of the snapshot used.</p>
-<p><strong>Errors</strong></p>
-<table>
-<tr><th>Code</th><th>Reason</th></tr>
-<tr><td><code>400</code></td><td>Invalid <code>location_id</code></td></tr>
-<tr><td><code>404</code></td><td>Unknown location</td></tr>
-<tr><td><code>503</code></td><td>No snapshots yet, or fewer than 2 snapshots available</td></tr>
-</table>
-<hr>
-
-<h3 id="ep-history-range"><span class="get">GET</span> /history/{range}</h3>
-<p>Universe-wide precomputed history &mdash; one NDJSON row per precomputed region or NPC station. Used by eveHauler to bulk-load fill caps without per-station POST requests.</p>
-<p>Precomputed ranges: <code>7d</code>, <code>14d</code>, <code>30d</code>.</p>
-<pre><code>GET /history/7d
-GET /history/30d</code></pre>
-<p><strong>Response</strong> <code>200 application/x-ndjson</code></p>
-<pre><code>{"scope":"station","location_id":60003760,"range":"30d",
- "types":{"34":{"buy":{...},"sell":{...}},...}}</code></pre>
-<table>
-<tr><th>Field</th><th>Type</th><th>Description</th></tr>
-<tr><td><code>scope</code></td><td>string</td><td><code>"region"</code> or <code>"station"</code></td></tr>
-<tr><td><code>location_id</code></td><td>int</td><td>Region or NPC station ID</td></tr>
-<tr><td><code>range</code></td><td>string</td><td>Range label matching the request (e.g. <code>"30d"</code>)</td></tr>
-<tr><td><code>types</code></td><td>object</td><td>Map of <code>type_id</code> string &rarr; <code>{"buy":{&hellip;},"sell":{&hellip;}}</code> &mdash; same shape as <a href="#ep-stats">POST /stats</a> response values</td></tr>
-</table>
-<p>Response headers: <code>X-History-Range</code> (range label), <code>X-Snapshot-Unix</code> (precompute metadata unix, if available).</p>
-<p><strong>Errors</strong></p>
-<table>
-<tr><th>Code</th><th>Reason</th></tr>
-<tr><td><code>400</code></td><td>Invalid or non-precomputed range</td></tr>
-</table>
-<hr>
-
-<h3 id="ep-contracts-courier"><span class="get">GET</span> /contracts/courier</h3>
-<p>Every currently-active public courier contract, universe-wide, from the latest contracts snapshot.</p>
-<pre><code>GET /contracts/courier</code></pre>
-<p><strong>Response</strong> <code>200 application/x-ndjson</code></p>
-<pre><code>{"contract_id":12345678,"region_id":10000002,
- "start_location_id":60003760,"end_location_id":60008494,
- "reward":5000000.0,"collateral":500000000.0,"volume":10000.0,
- "days_to_complete":3,"date_issued":"2026-04-22T14:00:00Z",
- "date_expired":"2026-04-29T14:00:00Z","title":""}</code></pre>
-<table>
-<tr><th>Field</th><th>Type</th><th>Description</th></tr>
-<tr><td><code>contract_id</code></td><td>int</td><td>ESI contract ID</td></tr>
-<tr><td><code>region_id</code></td><td>int</td><td>Region the contract was collected from</td></tr>
-<tr><td><code>start_location_id</code></td><td>int</td><td>Pickup station or structure</td></tr>
-<tr><td><code>end_location_id</code></td><td>int</td><td>Dropoff station or structure</td></tr>
-<tr><td><code>reward</code></td><td>float</td><td>ISK reward offered</td></tr>
-<tr><td><code>collateral</code></td><td>float</td><td>ISK collateral required</td></tr>
-<tr><td><code>volume</code></td><td>float</td><td>Cargo volume in m&sup3;</td></tr>
-<tr><td><code>days_to_complete</code></td><td>int</td><td>Days to complete after acceptance</td></tr>
-<tr><td><code>date_issued</code></td><td>string</td><td>ISO&nbsp;8601 UTC</td></tr>
-<tr><td><code>date_expired</code></td><td>string</td><td>ISO&nbsp;8601 UTC &mdash; only non-expired contracts are returned</td></tr>
-<tr><td><code>title</code></td><td>string</td><td>Contract title (may be empty)</td></tr>
-</table>
-<p>Response header <code>X-Contracts-Snapshot-Unix</code> carries the unix timestamp of the snapshot used.</p>
-<p><strong>Errors</strong></p>
-<table>
-<tr><th>Code</th><th>Reason</th></tr>
-<tr><td><code>503</code></td><td>No contracts snapshot yet</td></tr>
-</table>
-<hr>
-
-<h3 id="ep-stats"><span class="post">POST</span> /stats/{location_id}</h3>
-<p>Order-book statistics from the latest snapshot scoped to the given location. Served from precomputed files for regions and NPC stations (fast); falls back to live snapshot scan for constellations, systems, and structures.</p>
-<pre><code>POST /stats/10000002
-POST /stats/60003760
-Content-Type: application/json
-
-[34, 35, 36]</code></pre>
-<p><strong>Request body</strong> &mdash; JSON array of <code>type_id</code> integers (max 1&nbsp;MiB).</p>
-<p><strong>Response</strong> <code>200 application/json</code> &mdash; object keyed by stringified <code>type_id</code>:</p>
-<pre><code>{
-  "34": {
-    "buy":  {"weightedAverage":"4.07","max":"4.18","min":"0.56","stddev":"0.83",
-             "median":"4.09","volume":"8192983945.0","orderCount":"32","percentile":"4.07"},
-    "sell": {"weightedAverage":"4.54","max":"999","min":"4.18","stddev":"2.33",
-             "median":"4.75","volume":"5078497821.0","orderCount":"46","percentile":"4.20"}
-  }
-}</code></pre>
-<p>All numeric fields are returned as strings to preserve precision.</p>
-<table>
-<tr><th>Field</th><th>Description</th></tr>
-<tr><td><code>weightedAverage</code></td><td>Volume-weighted mean price</td></tr>
-<tr><td><code>max</code></td><td>Highest price in the order book</td></tr>
-<tr><td><code>min</code></td><td>Lowest price in the order book</td></tr>
-<tr><td><code>stddev</code></td><td>Volume-weighted standard deviation</td></tr>
-<tr><td><code>median</code></td><td>Median price</td></tr>
-<tr><td><code>volume</code></td><td>Total units on offer</td></tr>
-<tr><td><code>orderCount</code></td><td>Number of orders</td></tr>
-<tr><td><code>percentile</code></td><td>5th percentile for sell; 95th percentile for buy (best realistic fill price)</td></tr>
-</table>
-<p><strong>Errors</strong></p>
-<table>
-<tr><th>Code</th><th>Reason</th></tr>
-<tr><td><code>400</code></td><td>Invalid <code>location_id</code>; malformed or empty body</td></tr>
-<tr><td><code>404</code></td><td>Unknown location</td></tr>
-<tr><td><code>413</code></td><td>Body exceeds 1&nbsp;MiB</td></tr>
-<tr><td><code>503</code></td><td>No snapshots yet</td></tr>
-</table>
-<hr>
-
-<h3 id="ep-history-post"><span class="post">POST</span> /history/{location_id}/{range}</h3>
-<p>Historic market statistics aggregated from the server&rsquo;s inferred-trade tape. Same response shape as <a href="#ep-stats">POST /stats</a> (volumes are trade volume over the window, not standing-order counts). Precomputed ranges <code>7d</code>, <code>14d</code>, <code>30d</code> are fast; other valid expressions are computed live.</p>
-<pre><code>POST /history/10000002/30d
-POST /history/60003760/7d
-Content-Type: application/json
-
-[34, 35, 36]</code></pre>
-<table>
-<tr><th>Param</th><th>Format</th><th>Examples</th></tr>
-<tr><td><code>{range}</code></td><td><code>&lt;int&gt;&lt;h|d|w|m|y&gt;</code></td><td><code>1h</code>, <code>7d</code>, <code>14d</code>, <code>30d</code>, <code>644h</code></td></tr>
-</table>
-<p>Unit meanings: <code>h</code>&nbsp;= hours &middot; <code>d</code>&nbsp;= days &middot; <code>w</code>&nbsp;= weeks &middot; <code>m</code>&nbsp;= 30-day months &middot; <code>y</code>&nbsp;= 365-day years.</p>
-<p>Notes:</p>
-<ul>
-<li>Region scope aggregates every inferred trade in the region over the window.</li>
-<li>Station scope aggregates inferred trades whose <code>location_id</code> exactly matches the station (buy orders with a wider range are excluded).</li>
-<li>Types with no trades in the window return zeroed records.</li>
-</ul>
-<p><strong>Errors</strong></p>
-<table>
-<tr><th>Code</th><th>Reason</th></tr>
-<tr><td><code>400</code></td><td>Invalid <code>location_id</code>; invalid range string; malformed or empty body; player structure scope</td></tr>
-<tr><td><code>404</code></td><td>Unknown location</td></tr>
-<tr><td><code>413</code></td><td>Body exceeds 1&nbsp;MiB</td></tr>
-</table>
-
-<h2 id="data">Data Layout</h2>
-<p>Default under <code>./data</code>:</p>
-<table>
-<tr><th>Path</th><th>Description</th></tr>
-<tr><td><code>orders/orders-&lt;unix&gt;.jsonl</code></td><td>Raw snapshot &mdash; one order per line (latest 2 kept uncompressed)</td></tr>
-<tr><td><code>orders/orders-&lt;unix&gt;.jsonl.gz</code></td><td>Older snapshots, gzipped in place (~12&times; smaller)</td></tr>
-<tr><td><code>inferred/infer-&lt;unix&gt;.jsonl</code></td><td>Inferred trades for the latest snapshot pair</td></tr>
-<tr><td><code>inferred/infer-&lt;unix&gt;.jsonl.gz</code></td><td>Older inferred-trade files, gzipped in place</td></tr>
-<tr><td><code>inferred/infer-&lt;unix&gt;.done</code></td><td>Completion marker</td></tr>
-<tr><td><code>contracts/contracts-&lt;unix&gt;.jsonl</code></td><td>Raw public contracts snapshot</td></tr>
-<tr><td><code>history/region-&lt;id&gt;.json</code></td><td>Cached ESI per-region daily history</td></tr>
-<tr><td><code>precomputed/meta.json</code></td><td>Generation metadata (snapshot_unix, elapsed_s, counts)</td></tr>
-<tr><td><code>precomputed/stats/&lt;location_id&gt;.json</code></td><td>Order-book stats (regions + NPC stations)</td></tr>
-<tr><td><code>precomputed/history/&lt;region_id&gt;_&lt;range&gt;.json</code></td><td>Per-region inferred-trade stats (ranges: 7d, 14d, 30d)</td></tr>
-<tr><td><code>precomputed/history_station/&lt;station_id&gt;_&lt;range&gt;.json</code></td><td>Per-NPC-station inferred-trade stats (ranges: 7d, 14d, 30d)</td></tr>
-</table>
-<p>Historical <code>orders/</code> and <code>inferred/</code> files older than the latest 2&nbsp;/&nbsp;1 are gzipped automatically after every collection cycle. Reads are transparent &mdash; older snapshots via <code>GET /orders/{unix_time}</code> simply stream a bit slower. The <code>precomputed/</code> tree is left uncompressed as it is small and read on every <code>POST /stats</code> / <code>POST /history</code> request.</p>
+<p>All streaming endpoints return <code>application/x-ndjson</code> with \
+<code>Content-Encoding: gzip</code>. Default bind: <code>0.0.0.0:13307</code>.</p>
 </body>
 </html>"""
+    return body.encode("utf-8")
 
 
+def _build_rl_cards(by_group: dict, err_remain, err_reset_at, now: float) -> str:
+    """Build HTML card markup for the ESI rate-limit section of the dashboard."""
+    cards = []
+
+    if by_group:
+        for grp, state in sorted(by_group.items()):
+            rem = state.get("remaining")
+            lim = state.get("limit")
+            win = state.get("window_s")
+            if rem is not None and lim:
+                pct = rem / lim
+                color = "var(--green)" if pct > 0.33 else ("var(--orange)" if pct > 0.1 else "var(--red)")
+                val = f'<span style="color:{color}">{rem:,}/{lim:,}</span>'
+            elif rem is not None:
+                val = str(rem)
+            else:
+                val = "&mdash;"
+            sub = f"window {win}s" if win else "no window seen"
+            cards.append(
+                f'<div class="card"><h3>{html.escape(grp)}</h3>'
+                f'<div class="val">{val}</div>'
+                f'<div class="sub">{sub}</div></div>'
+            )
+    else:
+        cards.append(
+            '<div class="card"><h3>Request limit</h3>'
+            '<div class="val">&mdash;</div>'
+            '<div class="sub">no headers seen yet</div></div>'
+        )
+
+    # Global error budget (shared across all groups / endpoints).
+    if err_remain is not None:
+        if err_remain > 50:
+            err_color = "var(--green)"
+        elif err_remain > 10:
+            err_color = "var(--orange)"
+        else:
+            err_color = "var(--red)"
+        err_val = f'<span style="color:{err_color}">{err_remain}</span>'
+        if err_reset_at is not None:
+            reset_s = max(0, int(err_reset_at - now))
+            err_sub = f"resets in {reset_s}s"
+        else:
+            err_sub = "errors / 60 s window"
+    else:
+        err_val = "&mdash;"
+        err_sub = "no error-limit headers seen"
+    cards.append(
+        '<div class="card"><h3>Error Budget</h3>'
+        f'<div class="val">{err_val}</div>'
+        f'<div class="sub">{err_sub}</div></div>'
+    )
+
+    return "\n".join(cards)
+
+
+def _build_dash_html(state: "MarketState") -> bytes:
+    from .snapshot import list_snapshots, list_contracts_snapshots
+    from .precompute import read_meta as _read_pc_meta
+
+    now = time.time()
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(now))
+
+    # --- collector status ---
+    orders_st = state.orders_status.snapshot() if state.orders_status else {}
+    headers_st = state.headers_status.snapshot() if state.headers_status else {}
+    items_st = state.items_status.snapshot() if state.items_status else {}
+
+    # --- market orders ---
+    try:
+        snaps = list_snapshots(state.data_dir)
+    except Exception:
+        snaps = []
+    latest_order = snaps[-1] if snaps else None
+
+    # --- contracts ---
+    try:
+        c_snaps = list_contracts_snapshots(state.data_dir)
+    except Exception:
+        c_snaps = []
+    latest_contract = c_snaps[-1] if c_snaps else None
+
+    # --- contract items ---
+    items_fetched = 0
+    items_mb = "0 B"
+    if state.run_contracts:
+        try:
+            ist = contract_items_stats(state.data_dir)
+            items_fetched = ist.get("fetched_count", 0)
+            b = ist.get("items_file_bytes", 0)
+            items_mb = f"{b / 1_048_576:.1f} MB" if b >= 1024 else f"{b} B"
+        except Exception:
+            pass
+
+    # --- precompute ---
+    try:
+        pc = _read_pc_meta(state.data_dir) or {}
+    except Exception:
+        pc = {}
+    pc_snap_unix = pc.get("snapshot_unix")
+    pc_gen_unix  = pc.get("generated_unix")
+    pc_elapsed   = pc.get("elapsed_s")
+    pc_types     = pc.get("type_count")
+    pc_strict    = pc.get("strict_files", 0) or 0
+    pc_hist_r    = pc.get("history_region_files", 0) or 0
+    pc_hist_s    = pc.get("history_station_files", 0) or 0
+
+    # --- rate limits ---
+    rl_snap = state.client.rl_snapshot()
+    rl_by_group = rl_snap.get("by_group") or {}
+    err_remain = rl_snap.get("err_remain")
+    err_reset_at = rl_snap.get("err_reset_at")
+
+    # --- log buffer ---
+    log_html = "<p style='color:#8b949e;font-size:.85rem'>No log records captured yet.</p>"
+    if state.log_ring is not None:
+        records = state.log_ring.get_records()
+        if records:
+            rows = []
+            for levelno, text in reversed(records[-200:]):
+                lvl = logging.getLevelName(levelno)
+                rows.append(
+                    f'<tr class="log-{lvl}"><td>{html.escape(text)}</td></tr>'
+                )
+            log_html = f'<table class="log-table">{"".join(rows)}</table>'
+
+    # --- contracts section ---
+    con_section = ""
+    if state.run_contracts:
+        con_section = f"""
+<h2>Contracts</h2>
+<div style="margin:.3rem 0 .35rem;padding:.35rem .75rem;background:var(--bg2);border:1px solid var(--border);border-radius:5px;font-size:.88rem"><span style="color:#8b949e;font-size:.8rem;margin-right:.5rem">headers</span>{_render_status(headers_st, now)}</div>
+<div style="margin:.3rem 0 .7rem;padding:.35rem .75rem;background:var(--bg2);border:1px solid var(--border);border-radius:5px;font-size:.88rem"><span style="color:#8b949e;font-size:.8rem;margin-right:.5rem">items</span>{_render_status(items_st, now)}</div>
+<div class="cards">
+<div class="card"><h3>Snapshots</h3><div class="val">{len(c_snaps)}</div>\
+<div class="sub">on disk</div></div>
+<div class="card"><h3>Latest</h3><div class="val">{_ago(now, latest_contract)}</div>\
+<div class="sub">{_fmt_ts(latest_contract)}</div></div>
+<div class="card"><h3>Items Cached</h3><div class="val">{items_fetched:,}</div>\
+<div class="sub">contracts with items &mdash; {items_mb}</div></div>
+</div>"""
+
+    # --- precompute section ---
+    pc_section = ""
+    if pc:
+        pc_section = f"""
+<h2>Precompute</h2>
+<div class="cards">
+<div class="card"><h3>Snapshot</h3><div class="val">{_ago(now, pc_snap_unix)}</div>\
+<div class="sub">{_fmt_ts(pc_snap_unix)}</div></div>
+<div class="card"><h3>Generated</h3><div class="val">{_ago(now, pc_gen_unix)}</div>\
+<div class="sub">elapsed: {pc_elapsed}s</div></div>
+<div class="card"><h3>Types</h3><div class="val">{pc_types if pc_types is not None else "&mdash;"}</div>\
+<div class="sub">unique types tracked</div></div>
+<div class="card"><h3>Files</h3><div class="val">{pc_strict + pc_hist_r + pc_hist_s}</div>\
+<div class="sub">{pc_strict} stats &middot; {pc_hist_r} hist-region \
+&middot; {pc_hist_s} hist-station</div></div>
+</div>"""
+
+    body = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="15">
+<title>eveMarket Dashboard</title>
+<style>{_CSS}</style>
+</head>
+<body>
+<h1><a href="/" style="color:inherit;text-decoration:none">eveMarket</a> &mdash; Dashboard</h1>
+<p style="color:#8b949e;font-size:.85rem">Auto-refreshes every 15 s &mdash; {now_str}</p>
+
+<h2>Market Orders</h2>
+<div style="margin:.3rem 0 .7rem;padding:.35rem .75rem;background:var(--bg2);border:1px solid var(--border);border-radius:5px;font-size:.88rem">{_render_status(orders_st, now)}</div>
+<div class="cards">
+<div class="card"><h3>Snapshots</h3><div class="val">{len(snaps)}</div>\
+<div class="sub">on disk</div></div>
+<div class="card"><h3>Latest</h3><div class="val">{_ago(now, latest_order)}</div>\
+<div class="sub">{_fmt_ts(latest_order)}</div></div>
+</div>
+
+{con_section}
+
+<h2>ESI Rate Limits</h2>
+<div class="cards">
+{_build_rl_cards(rl_by_group, err_remain, err_reset_at, now)}
+</div>
+
+{pc_section}
+
+<h2>Recent Logs</h2>
+{log_html}
+</body>
+</html>"""
+    return body.encode("utf-8")
+
+
+# keep this marker so the old constant name doesn't confuse grep searches
 class MarketState:
     def __init__(
         self,
@@ -406,11 +479,23 @@ class MarketState:
         data_dir: Path,
         *,
         client: Optional[EsiClient] = None,
+        run_inference: bool = True,
+        run_contracts: bool = True,
+        log_ring: Optional[_RingHandler] = None,
+        orders_status: Optional[CollectionStatus] = None,
+        headers_status: Optional[CollectionStatus] = None,
+        items_status: Optional[CollectionStatus] = None,
     ) -> None:
         self.sde_dir = Path(sde_dir)
         self.data_dir = Path(data_dir)
         self.client = client or EsiClient()
         self.resolver = LocationResolver(self.sde_dir)
+        self.run_inference = run_inference
+        self.run_contracts = run_contracts
+        self.log_ring = log_ring
+        self.orders_status = orders_status
+        self.headers_status = headers_status
+        self.items_status = items_status
 
 
 def _make_handler(state: MarketState):
@@ -487,7 +572,7 @@ def _make_handler(state: MarketState):
             qs = parse_qs(url.query)
 
             if not parts:
-                return self._send_html(_ROOT_HTML)
+                return self._send_html(_build_root_html(state))
 
             head = parts[0]
 
@@ -593,27 +678,48 @@ def _make_handler(state: MarketState):
                     extra["X-Snapshot-Unix"] = snap_unix
                 return self._send_ndjson(rows, extra_headers=extra)
 
-            if head == "contracts" and len(parts) == 2 and parts[1] == "courier":
+            if head == "contracts" and len(parts) == 2:
+                sub = parts[1]
                 snap = latest_contracts_snapshot(state.data_dir)
                 if snap is None:
                     return self._send_json(503, {"error": "no contracts snapshot yet"})
                 snap_path = contracts_path(state.data_dir, snap)
                 if not snap_path.exists():
                     return self._send_json(503, {"error": "contracts snapshot missing on disk"})
-                rows = iter_courier_contracts(snap_path)
-                return self._send_ndjson(
-                    rows,
-                    extra_headers={"X-Contracts-Snapshot-Unix": snap},
-                )
+                hdrs = {"X-Contracts-Snapshot-Unix": snap}
+                if sub == "courier":
+                    return self._send_ndjson(iter_courier_contracts(snap_path), extra_headers=hdrs)
+                if sub == "sell":
+                    return self._send_ndjson(
+                        iter_item_exchange_contracts(
+                            snap_path, data_dir=state.data_dir, side="sell"
+                        ),
+                        extra_headers=hdrs,
+                    )
+                if sub == "buy":
+                    return self._send_ndjson(
+                        iter_item_exchange_contracts(
+                            snap_path, data_dir=state.data_dir, side="buy"
+                        ),
+                        extra_headers=hdrs,
+                    )
+                if sub == "auction":
+                    return self._send_ndjson(
+                        iter_auction_contracts(snap_path, data_dir=state.data_dir),
+                        extra_headers=hdrs,
+                    )
+
+            if head == "dash" and len(parts) == 1:
+                return self._send_html(_build_dash_html(state))
 
             # ----- browser UI -----
             if head == "browser" and len(parts) == 1:
                 from . import sde_market as _sdm
-                html = _make_browser_html(
+                _browser_html = _make_browser_html(
                     _sdm.market_group_tree(state.sde_dir),
                     _sdm.regions_list(state.sde_dir),
                 )
-                return self._send_html(html)
+                return self._send_html(_browser_html)
 
             # ----- appraisal-maxxer UI -----
             if head == "appraisal-maxxer" and len(parts) == 1:
@@ -1127,8 +1233,24 @@ def serve(
     bind: str = "0.0.0.0",
     port: int = 13307,
     client: Optional[EsiClient] = None,
+    run_inference: bool = True,
+    run_contracts: bool = True,
+    orders_status: Optional[CollectionStatus] = None,
+    headers_status: Optional[CollectionStatus] = None,
+    items_status: Optional[CollectionStatus] = None,
 ) -> ThreadingHTTPServer:
-    state = MarketState(sde_dir, data_dir, client=client)
+    ring = _RingHandler()
+    logging.getLogger().addHandler(ring)
+    state = MarketState(
+        sde_dir, data_dir,
+        client=client,
+        run_inference=run_inference,
+        run_contracts=run_contracts,
+        log_ring=ring,
+        orders_status=orders_status,
+        headers_status=headers_status,
+        items_status=items_status,
+    )
     handler_cls = _make_handler(state)
     httpd = _QuietThreadingHTTPServer((bind, port), handler_cls)
     logger.info("eveMarket HTTP listening on http://%s:%s", bind, port)

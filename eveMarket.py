@@ -120,6 +120,11 @@ def main() -> int:
         bind=args.bind,
         port=args.port,
         client=client,
+        run_inference=not args.no_inference,
+        run_contracts=not args.no_contracts,
+        orders_status=scheduler.orders_status,
+        headers_status=contract_scheduler.headers_status if contract_scheduler is not None else None,
+        items_status=contract_scheduler.items_status if contract_scheduler is not None else None,
     )
 
     shutting_down = threading.Event()
