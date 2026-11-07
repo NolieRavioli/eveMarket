@@ -26,6 +26,8 @@ Optional flags:
 | `--sde` | `./sde` | SDE directory (auto-downloaded if missing) |
 | `--interval` | `1200` | Collection interval in seconds (20 min) |
 | `--no-inference` | | Disable inferred-trade processing |
+| `--no-esi-history` | | Disable `POST /esiHistory` (the ESI daily-history cache) |
+| `--history-warm-types` | `3000` | Daily after ESI's rollover, refresh the busiest N types of the five hub regions (`0` = off) |
 | `--log-level` | `INFO` | Python logging level |
 
 ## Response formats
@@ -75,7 +77,12 @@ GET /health
 {
   "ok": true,
   "snapshots": 18,
-  "latest_unix": 1777272798
+  "latest_unix": 1777272798,
+  "quote_books": {"books": [{"snapshot_unix": 1777272798, "location_id": 60003760}], "builds": 4},
+  "history": {"pairs": 15012, "regions": 5, "fresh_pairs": 14990, "rows": 5990000,
+              "fetches_since_start": 120, "last_fetch_unix": 1777272000, "last_error": null,
+              "db_bytes": 310000000, "warm": {"last_run_unix": 1777270000, "running": false,
+              "done": 15000, "total": 15000}}
 }
 ```
 
@@ -84,6 +91,8 @@ GET /health
 | `ok` | bool | Always `true` |
 | `snapshots` | int | Number of snapshots on disk |
 | `latest_unix` | int\|null | Unix timestamp of the latest snapshot |
+| `quote_books` | object | `POST /quote` book cache: books held (snapshot, location) and builds since start |
+| `history` | object | `POST /esiHistory` cache: (region, type) pairs fetched, pairs fresh since the last rollover, stored days, DB size, warm-up progress (absent with `--no-esi-history`) |
 
 ---
 
@@ -311,6 +320,131 @@ snapshot used.
 
 ---
 
+### `POST /quote/{location_id}`
+
+Order-book **fills for real quantities** from the latest snapshot: what buying or selling `qty` units would
+actually average, walking the book. Same location scoping as `/stats`.
+
+```
+POST /quote/60003760
+Content-Type: application/json
+
+[{"type_id": 34, "qty": 1000000, "side": "sell"},
+ {"type_id": 30375, "qty": 2000, "side": "buy", "levels": true}]
+```
+
+| Line field | Description |
+|------------|-------------|
+| `type_id` | Item type |
+| `qty` | Units to fill |
+| `side` | `"sell"` = we sell into **buy orders** (bids walked high → low); `"buy"` = we buy from **sell orders** (asks walked low → high) |
+| `levels` | Optional `true`: also return the orders used (`[price, volume_remain, min_volume]`, at most 500), so a client can walk any smaller quantity itself |
+
+Scope rules: regions, constellations and systems use every order in them. An **NPC station** uses sell orders
+in that station, and buy orders in that station **plus** buy orders elsewhere whose `range` reaches it
+(`solarsystem`, `constellation`, `region`, or `N` jumps by the SDE gate graph). A structure uses only its own
+orders. Bids are walked with EVE's minimum-volume rule: an order whose `min_volume` exceeds what is still to
+be filled is skipped. When the book can't absorb `qty`, `filled < requested`; the client decides how to value
+the rest.
+
+**Response** `200 application/json`, keyed by `type_id:side` (numbers as strings, like `/stats`):
+
+```json
+{"34:sell": {"requested": "1000000", "filled": "1000000", "vwap": "4.03", "best": "4.03", "worst": "4.03",
+             "orders_used": "1", "depth_total": "8541983943", "snapshot_unix": 1794080406},
+ "30375:buy": {"requested": "2000", "filled": "2000", "vwap": "13200", "best": "13200", "worst": "13200",
+               "orders_used": "1", "depth_total": "450142", "snapshot_unix": 1794080406,
+               "levels": [["13200", "2500", "1"]]}}
+```
+
+`depth_total` is everything on that side in scope. Header `X-Snapshot-Unix` names the snapshot (also sent by
+`POST /stats`). Books are built per (snapshot, location) on first use (~2 s for Jita 4-4) and cached (3 most
+recent). At most 2,000 lines per request.
+
+**Errors:** `400` bad body, `404` unknown location, `413` body over 1 MiB, `503` no snapshot yet.
+
+---
+
+### `POST /esiHistory/{region_id}?days=30`
+
+ESI daily market history (`GET /markets/{region_id}/history/`) through a shared cache, plus summaries.
+Inference stays off; this is ESI's own data.
+
+```
+POST /esiHistory/10000002?days=30
+Content-Type: application/json
+
+[34, 30375, 4247]
+```
+
+**Response** `200 application/json`
+
+```json
+{"34": {"days": [{"date": "2026-11-06", "average": "4.11", "highest": "4.2", "lowest": "4.02",
+                  "volume": "9123456789", "order_count": "4123"}],
+        "avg_7d": "4.1", "vwavg_30d": "4.07", "median_30d": "4.08", "adv_30d": "8500000000",
+        "last_date": "2026-11-06"}}
+```
+
+| Field | Description |
+|-------|-------------|
+| `days` | Daily rows in the window (`days`, default 30, max 400), oldest first |
+| `avg_7d` | Mean daily average of the last 7 days with trades |
+| `vwavg_30d` | Volume-weighted average over the window |
+| `median_30d` | Median daily average over the window |
+| `adv_30d` | Average daily volume over the window's calendar days (days without trades count as 0) |
+| `last_date` | Newest day (ESI's newest is yesterday) |
+
+Each (region, type) is fetched lazily and cached until ESI's next daily rollover (≈ 11:05 UTC); a 404 is
+retried after 30 minutes. Stored in `data/history/esi_history.sqlite` (400 days kept). A daily warm-up
+(`--history-warm-types`) refreshes the busiest types of The Forge, Domain, Sinq Laison, Heimatar and
+Metropolis after the rollover, at most 4 ESI calls a second (it shares ESI's error budget with the collector).
+At most 500 type ids per request; uncached ones cost one ESI call each.
+
+**Errors:** `400` not a region id / bad body, `503` cache disabled.
+
+---
+
+### `GET /contracts/itemExchange`
+
+Active public **item-exchange** contracts with their items, in the shape sibling tools read
+(`/contracts/sell` and `/contracts/buy` keep their richer projection).
+
+```
+GET /contracts/itemExchange
+GET /contracts/itemExchange?region_id=10000002&type_id=691
+```
+
+**Response** `200 application/x-ndjson`
+
+```json
+{"contract_id": 236935744, "region_id": 10000002, "location_id": 60003760, "price": 57600000.0, "reward": 0.0,
+ "date_issued": "2026-10-11T15:18:36Z", "date_expired": "2026-11-08T15:18:36Z", "title": "",
+ "items": [{"type_id": 691, "quantity": 1, "is_included": true, "is_blueprint_copy": true,
+            "material_efficiency": 10, "time_efficiency": 20, "runs": 10}]}
+```
+
+`items` is `null` until the items collector has fetched that contract. Filters: `region_id`, `type_id`
+(contracts containing that type). Header `X-Contracts-Snapshot-Unix`.
+
+---
+
+### `GET /contracts/bpc?type_id={blueprint_type_id}`
+
+Per-run prices of contracts that sell exactly **one BPC** of that blueprint and nothing else:
+`{type_id, contracts, per_run: {min, p10, p25, median}, rows: [{contract_id, region_id, location_id, price,
+runs, material_efficiency, time_efficiency, per_run, date_issued}]}` (cheapest 200 rows). Prices are raw
+`price / runs`; normalising to ME0 needs material prices and is left to the caller (eveBuyback ECONOMICS §5.5).
+
+---
+
+### `GET /esi/adjustedPrices` and `GET /esi/costIndices`
+
+ESI `/markets/prices/` and `/industry/systems/`, cached for an hour (in memory and in `data/refdata/`) so all
+sibling tools share one copy. A stale copy is served when ESI fails. Header `X-Fetched-Unix`.
+
+---
+
 ### `POST /stats/{location_id}`
 
 Order-book statistics from the latest snapshot scoped to the given location.
@@ -455,7 +589,9 @@ Default under `./data`:
 | `inferred/infer-<unix>.jsonl.gz` | Older inferred-trade files, gzipped in place |
 | `inferred/infer-<unix>.done` | Completion marker |
 | `contracts/contracts-<unix>.jsonl` | Raw public contracts snapshot |
-| `history/region-<id>.json` | Cached ESI per-region daily history |
+| `history/region-<id>.json` | Cached ESI per-region daily history (inference, `/api/esi_history`) |
+| `history/esi_history.sqlite` | `POST /esiHistory` cache: daily rows (400 days) and fetch times per (region, type) |
+| `refdata/{adjustedPrices,costIndices}.json` | Last good copies for `GET /esi/...` |
 | `precomputed/meta.json` | Generation metadata (snapshot_unix, elapsed_s, counts) |
 | `precomputed/stats/<location_id>.json` | Order-book stats (regions + NPC stations) |
 | `precomputed/history/<region_id>_<range>.json` | Per-region inferred-trade stats (ranges: 7d, 14d, 30d) |
@@ -474,3 +610,13 @@ under `precomputed/` from the new snapshot. `POST /stats` and `POST /history`
 serve those files directly (filtered by the request's `type_ids` body) and
 respond in under 100 ms. Custom ranges and non-region/station scopes compute
 live on the fly.
+
+## Tests
+
+```bash
+python -m unittest discover -s testing -p "test_buyback_api.py" -v
+```
+
+Self-contained (fake SDE, snapshot and ESI): the `/quote` book walk (partial fills, `min_volume`, buy-order
+range), the `/esiHistory` cache, `/contracts/itemExchange`, `/contracts/bpc` and `/esi/*`.
+`testing/test_endpoints.py` is a manual tester against a running server.

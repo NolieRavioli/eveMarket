@@ -11,6 +11,12 @@ Endpoints:
                                         snapshot pair, filtered to the location.
   GET /history/{range}              -> NDJSON of universe-wide precomputed history
   GET /contracts/courier            -> NDJSON of active public courier contracts
+  GET /contracts/itemExchange       -> NDJSON of active item-exchange contracts with items
+  GET /contracts/bpc?type_id=       -> per-run prices of single-BPC contracts
+  GET /esi/adjustedPrices           -> cached ESI /markets/prices (1 h)
+  GET /esi/costIndices              -> cached ESI /industry/systems (1 h)
+  POST /quote/{location_id}         -> order-book fills for real quantities
+  POST /esiHistory/{region_id}      -> cached ESI daily history + 7/30-day summaries
 
 NDJSON: one JSON object per line; Content-Type: application/x-ndjson.
 Responses are gzip-encoded when the client sends ``Accept-Encoding: gzip``
@@ -33,11 +39,18 @@ from urllib.parse import parse_qs, urlsplit
 from .esi import EsiClient
 from .scheduler import CollectionStatus
 from .contracts import (
+    bpc_summary,
     contract_items_stats,
     iter_auction_contracts,
     iter_courier_contracts,
     iter_item_exchange_contracts,
+    iter_item_exchange_feed,
 )
+from .esi_history import MAX_TYPES_PER_REQUEST, EsiHistoryStore
+from .jumps import JumpGraph
+from .quote import BookIndex, QuoteError, parse_lines
+from .quote import quote as quote_book
+from .refdata import RefData
 from .index import filter_snapshot, iter_snapshot, matches
 from .inferred import diff_snapshots, load_inferred
 from .location import LocationResolver
@@ -485,6 +498,8 @@ class MarketState:
         orders_status: Optional[CollectionStatus] = None,
         headers_status: Optional[CollectionStatus] = None,
         items_status: Optional[CollectionStatus] = None,
+        history: Optional[EsiHistoryStore] = None,
+        history_warmer=None,
     ) -> None:
         self.sde_dir = Path(sde_dir)
         self.data_dir = Path(data_dir)
@@ -496,6 +511,10 @@ class MarketState:
         self.orders_status = orders_status
         self.headers_status = headers_status
         self.items_status = items_status
+        self.history = history
+        self.history_warmer = history_warmer
+        self.books = BookIndex(self.resolver, JumpGraph(self.sde_dir))
+        self.refdata = RefData(self.data_dir, self.client)
 
 
 def _make_handler(state: MarketState):
@@ -507,11 +526,16 @@ def _make_handler(state: MarketState):
             logger.info("%s - " + fmt, self.address_string(), *args)
 
         # ---------- helpers ----------
-        def _send_json(self, code: int, payload: dict) -> None:
+        def _send_json(self, code: int, payload: dict, extra_headers: Optional[dict] = None) -> None:
             body = json.dumps(payload).encode("utf-8")
+            self._send_json_bytes(code, body, extra_headers)
+
+        def _send_json_bytes(self, code: int, body: bytes, extra_headers: Optional[dict] = None) -> None:
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            for k, v in (extra_headers or {}).items():
+                self.send_header(k, str(v))
             self.end_headers()
             self.wfile.write(body)
 
@@ -578,11 +602,27 @@ def _make_handler(state: MarketState):
 
             if head == "health" and len(parts) == 1:
                 snaps = list_snapshots(state.data_dir)
-                return self._send_json(200, {
+                payload = {
                     "ok": True,
                     "snapshots": len(snaps),
                     "latest_unix": snaps[-1] if snaps else None,
-                })
+                    "quote_books": state.books.stats(),
+                }
+                if state.history is not None:
+                    payload["history"] = state.history.stats()
+                    if state.history_warmer is not None:
+                        payload["history"]["warm"] = dict(state.history_warmer.status)
+                return self._send_json(200, payload)
+
+            if head == "esi" and len(parts) == 2:
+                try:
+                    body, fetched_at = state.refdata.get(parts[1])
+                except KeyError:
+                    return self._send_json(404, {"error": "unknown dataset",
+                                                 "hint": "adjustedPrices or costIndices"})
+                except RuntimeError as exc:
+                    return self._send_json(503, {"error": str(exc)})
+                return self._send_json_bytes(200, body, {"X-Fetched-Unix": int(fetched_at)})
 
             if head == "currentOrders" and len(parts) == 2:
                 lid = self._parse_int(parts[1])
@@ -687,6 +727,19 @@ def _make_handler(state: MarketState):
                 if not snap_path.exists():
                     return self._send_json(503, {"error": "contracts snapshot missing on disk"})
                 hdrs = {"X-Contracts-Snapshot-Unix": snap}
+                if sub == "itemExchange":
+                    rid = self._parse_int(qs.get("region_id", [""])[0]) if qs.get("region_id") else None
+                    tid = self._parse_int(qs.get("type_id", [""])[0]) if qs.get("type_id") else None
+                    return self._send_ndjson(
+                        iter_item_exchange_feed(snap_path, data_dir=state.data_dir, region_id=rid, type_id=tid),
+                        extra_headers=hdrs,
+                    )
+                if sub == "bpc":
+                    tid = self._parse_int(qs.get("type_id", [""])[0])
+                    if tid is None:
+                        return self._send_json(400, {"error": "type_id (the blueprint type) is required"})
+                    return self._send_json(200, bpc_summary(snap_path, data_dir=state.data_dir, type_id=tid),
+                                           extra_headers=hdrs)
                 if sub == "courier":
                     return self._send_ndjson(iter_courier_contracts(snap_path), extra_headers=hdrs)
                 if sub == "sell":
@@ -946,7 +999,9 @@ def _make_handler(state: MarketState):
                     for tid in type_ids:
                         key = str(tid)
                         out[key] = file_payload.get(key) or empty_template()
-                    return self._send_json(200, out)
+                    meta = read_precomputed_meta(state.data_dir) or {}
+                    hdrs = {"X-Snapshot-Unix": meta["snapshot_unix"]} if meta.get("snapshot_unix") else None
+                    return self._send_json(200, out, hdrs)
 
                 # Fallback: live compute (covers constellations, systems, and
                 # the gap before the first precompute cycle finishes).
@@ -954,7 +1009,45 @@ def _make_handler(state: MarketState):
                 if snap_path is None:
                     return self._send_json(503, {"error": "no snapshots yet"})
                 payload = compute_live_stats(snap_path, info, type_ids)
-                return self._send_json(200, payload)
+                return self._send_json(200, payload, {"X-Snapshot-Unix": latest_snapshot(state.data_dir)})
+
+            if head == "quote" and len(parts) == 2:
+                lid = self._parse_int(parts[1])
+                if lid is None:
+                    return self._send_json(400, {"error": "invalid location_id"})
+                info = state.resolver.classify(lid)
+                if info.kind == "unknown":
+                    return self._send_json(404, {"error": "unknown location"})
+                body = self._read_body()
+                if body is None:
+                    return
+                try:
+                    lines = parse_lines(body)
+                except QuoteError as exc:
+                    return self._send_json(400, {"error": str(exc)})
+                snap = latest_snapshot(state.data_dir)
+                if snap is None:
+                    return self._send_json(503, {"error": "no snapshots yet"})
+                book = state.books.get(orders_path(state.data_dir, snap), snap, info)
+                return self._send_json(200, quote_book(book, lines), {"X-Snapshot-Unix": snap})
+
+            if head == "esiHistory" and len(parts) == 2:
+                rid = self._parse_int(parts[1])
+                if rid is None or not 10_000_000 <= rid <= 10_999_999:
+                    return self._send_json(400, {"error": "region_id must be a region (10000001-10999999)"})
+                if state.history is None:
+                    return self._send_json(503, {"error": "ESI history cache is disabled"})
+                qs = parse_qs(url.query)
+                days = self._parse_int(qs.get("days", ["30"])[0]) or 30
+                body = self._read_body()
+                if body is None:
+                    return
+                type_ids = self._parse_type_ids(body)
+                if type_ids is None:
+                    return
+                if len(type_ids) > MAX_TYPES_PER_REQUEST:
+                    return self._send_json(400, {"error": f"at most {MAX_TYPES_PER_REQUEST} type_ids per request"})
+                return self._send_json(200, state.history.get(rid, type_ids, days))
 
             if head == "appraisal-maxxer" and len(parts) == 1:
                 body = self._read_body()
@@ -1238,6 +1331,8 @@ def serve(
     orders_status: Optional[CollectionStatus] = None,
     headers_status: Optional[CollectionStatus] = None,
     items_status: Optional[CollectionStatus] = None,
+    history: Optional[EsiHistoryStore] = None,
+    history_warmer=None,
 ) -> ThreadingHTTPServer:
     ring = _RingHandler()
     logging.getLogger().addHandler(ring)
@@ -1250,6 +1345,8 @@ def serve(
         orders_status=orders_status,
         headers_status=headers_status,
         items_status=items_status,
+        history=history,
+        history_warmer=history_warmer,
     )
     handler_cls = _make_handler(state)
     httpd = _QuietThreadingHTTPServer((bind, port), handler_cls)

@@ -23,6 +23,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from eveMarket import EsiClient, CollectorScheduler, ContractScheduler, DowntimeGuard, serve  # noqa: E402
+from eveMarket.esi_history import EsiHistoryStore, HistoryWarmer  # noqa: E402
 from eveMarket.sde_download import download_sde, fetch_latest_build_number, read_local_build  # noqa: E402
 
 DEFAULT_SDE = HERE / "sde"
@@ -47,6 +48,11 @@ def main() -> int:
                     help="Disable inferred-trade computation in the scheduler")
     ap.add_argument("--no-contracts", action="store_true",
                     help="Disable the public-contracts scheduler")
+    ap.add_argument("--no-esi-history", action="store_true",
+                    help="Disable POST /esiHistory (the ESI daily-history cache)")
+    ap.add_argument("--history-warm-types", type=int, default=3000,
+                    help="Daily warm-up: busiest N types per hub region fetched after ESI's "
+                         "rollover (0 = off; default 3000)")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
 
@@ -114,6 +120,14 @@ def main() -> int:
         log.info("contracts scheduler started (interval=%ss)",
                  args.contracts_interval)
 
+    history = None if args.no_esi_history else EsiHistoryStore(args.data, client=client)
+    warmer = None
+    if history is not None and args.history_warm_types > 0:
+        warmer = HistoryWarmer(history, args.data, n_types=args.history_warm_types)
+        warmer.start()
+        log.info("esiHistory warm-up on (%s types per hub region, daily after 11:15 UTC)",
+                 args.history_warm_types)
+
     httpd = serve(
         sde_dir=args.sde,
         data_dir=args.data,
@@ -125,6 +139,8 @@ def main() -> int:
         orders_status=scheduler.orders_status,
         headers_status=contract_scheduler.headers_status if contract_scheduler is not None else None,
         items_status=contract_scheduler.items_status if contract_scheduler is not None else None,
+        history=history,
+        history_warmer=warmer,
     )
 
     shutting_down = threading.Event()
@@ -140,6 +156,8 @@ def main() -> int:
         # serve_forever() is on this very (main) thread. Run shutdown
         # from a helper thread to avoid the deadlock.
         def _do():
+            if warmer is not None:
+                warmer.stop()
             scheduler.stop()
             if contract_scheduler is not None:
                 contract_scheduler.stop()
