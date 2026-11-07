@@ -929,3 +929,91 @@ def iter_courier_contracts(
             "date_expired":     row.get("date_expired"),
             "title":            row.get("title") or "",
         }
+
+
+# ---------------------------------------------------------------------------
+# Item-exchange feed for sibling tools (GET /contracts/itemExchange) and a
+# blueprint-copy price summary (GET /contracts/bpc?type_id=)
+# ---------------------------------------------------------------------------
+
+_FEED_ITEM_KEYS = ("type_id", "quantity", "is_included", "is_blueprint_copy",
+                   "material_efficiency", "time_efficiency", "runs")
+
+
+def iter_item_exchange_feed(
+    snapshot_path: Path,
+    *,
+    data_dir: Optional[Path] = None,
+    region_id: Optional[int] = None,
+    type_id: Optional[int] = None,
+    now_iso: Optional[str] = None,
+) -> Iterator[dict]:
+    """Active public item-exchange contracts in the shape eveBuyback and eveInvention read.
+
+    ``{contract_id, region_id, location_id, price, reward, date_issued, date_expired, title, items}`` where
+    ``items`` lists ``{type_id, quantity, is_included, is_blueprint_copy, material_efficiency,
+    time_efficiency, runs}`` (``null`` while the contract's items haven't been collected yet).
+    Optional filters: ``region_id``, and ``type_id`` (contracts containing that type; needs items).
+    """
+    for row in iter_item_exchange_contracts(snapshot_path, data_dir=data_dir, now_iso=now_iso):
+        if region_id is not None and row.get("region_id") != region_id:
+            continue
+        items = row.get("items")
+        feed_items = None
+        if items is not None:
+            feed_items = [{k: it.get(k) for k in _FEED_ITEM_KEYS} for it in items]
+            for it in feed_items:
+                it["is_blueprint_copy"] = bool(it["is_blueprint_copy"])
+        if type_id is not None and not any((it.get("type_id") == type_id) for it in (feed_items or [])):
+            continue
+        yield {
+            "contract_id": row.get("contract_id"),
+            "region_id": row.get("region_id"),
+            "location_id": row.get("start_location_id"),
+            "price": row.get("price"),
+            "reward": row.get("reward"),
+            "date_issued": row.get("date_issued"),
+            "date_expired": row.get("date_expired"),
+            "title": row.get("title"),
+            "items": feed_items,
+        }
+
+
+def _percentile(sorted_vals: list, q: float) -> Optional[float]:
+    if not sorted_vals:
+        return None
+    k = (len(sorted_vals) - 1) * q / 100.0
+    lo, hi = int(k), min(int(k) + 1, len(sorted_vals) - 1)
+    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (k - lo)
+
+
+def bpc_summary(snapshot_path: Path, *, data_dir: Path, type_id: int) -> dict:
+    """Per-run prices of public contracts selling exactly one BPC of ``type_id`` and nothing else.
+
+    Raw ``price / runs`` with each contract's ME/TE; the ME0 normalisation (ECONOMICS §5.5 in eveBuyback,
+    the eveInvention method) needs material prices and is done by the caller.
+    """
+    rows = []
+    for c in iter_item_exchange_feed(snapshot_path, data_dir=data_dir, type_id=int(type_id)):
+        items = [it for it in (c.get("items") or []) if it.get("is_included", True)]
+        if len(items) != 1:
+            continue
+        it = items[0]
+        if not it.get("is_blueprint_copy") or it.get("type_id") != int(type_id) or int(it.get("quantity") or 1) != 1:
+            continue
+        runs = int(it.get("runs") or 0)
+        price = float(c.get("price") or 0)
+        if runs <= 0 or price <= 0:
+            continue
+        rows.append({"contract_id": c["contract_id"], "region_id": c["region_id"], "location_id": c["location_id"],
+                     "price": price, "runs": runs, "material_efficiency": int(it.get("material_efficiency") or 0),
+                     "time_efficiency": int(it.get("time_efficiency") or 0), "per_run": price / runs,
+                     "date_issued": c.get("date_issued")})
+    per_run = sorted(r["per_run"] for r in rows)
+    return {
+        "type_id": int(type_id),
+        "contracts": len(rows),
+        "per_run": {"min": per_run[0] if per_run else None, "p10": _percentile(per_run, 10),
+                    "p25": _percentile(per_run, 25), "median": _percentile(per_run, 50)},
+        "rows": sorted(rows, key=lambda r: r["per_run"])[:200],
+    }
